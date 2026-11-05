@@ -209,6 +209,8 @@ private:
         boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result) const;
 
     std::atomic<GPUVAddr> native_syncpoint_shim{};
+    /// Bumped after each page table change: buffer skip lookups and MaxContinuousRange answers
+    /// are kept until then.
     std::atomic<u64> map_serial{};
     Core::System& system;
     MaxwellDeviceMemoryManager& memory;
@@ -254,8 +256,6 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
-    /// Bumped after each page table change; MaxContinuousRange answers are kept until then.
-    std::atomic<u64> map_serial{};
 
     static constexpr size_t continuous_bits = 64;
 
