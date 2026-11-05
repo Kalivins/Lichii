@@ -53,6 +53,7 @@ template <typename Func>
 void OnBack(const Func& func) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.Defer(func);
+        split.NoteMemoryWrite();
     } else {
         func();
     }
