@@ -32,7 +32,22 @@ namespace {
 
 using VideoCore::Surface::PixelFormat;
 
-constexpr size_t SIZE_CAP = size_t{2} << 30;
+/// Uncompressed bytes one capture may read back. EDEN_NX2_FRAME_DUMP_CAP=<GiB> (1-16) raises the
+/// 2 GiB default, so a sampled capture of a busy frame keeps its last passes.
+size_t SizeCap() {
+    static const size_t cap = [] {
+        const char* const text = std::getenv("EDEN_NX2_FRAME_DUMP_CAP");
+        if (text == nullptr) return size_t{2} << 30;
+        char* end = nullptr;
+        const unsigned long long gib = std::strtoull(text, &end, 10);
+        if (end == text || *end != 0 || gib < 1 || gib > 16) {
+            LOG_WARNING(Render_Vulkan, "Frame dump: EDEN_NX2_FRAME_DUMP_CAP={} is not 1-16, using 2", text);
+            return size_t{2} << 30;
+        }
+        return static_cast<size_t>(gib) << 30;
+    }();
+    return cap;
+}
 /// RecordingSampledTextures: a sampled capture is running.
 std::atomic<bool> recording_sampled{};
 constexpr size_t STAGING_BUDGET = size_t{256} << 20;
@@ -633,7 +648,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         return false;
     }
     const size_t size = TargetBytes(target);
-    if (recorded_bytes + size > SIZE_CAP) {
+    if (recorded_bytes + size > SizeCap()) {
         truncated = true;
         return false;
     }
@@ -687,7 +702,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
 }
 
 bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
-    if (recorded_bytes + size > SIZE_CAP) {
+    if (recorded_bytes + size > SizeCap()) {
         truncated = true;
         return false;
     }
@@ -785,7 +800,7 @@ void FrameDump::WriterLoop() {
             manifest.close();
             LOG_INFO(Render_Vulkan, "Frame dump done: {} images, {}, {} MiB in {}{}", images,
                      job.tags, written_bytes >> 20, directory.string(),
-                     job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SIZE_CAP >> 30)
+                     job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SizeCap() >> 30)
                                    : "");
             if (const u64 id = schedule.CaptureId(); id != 0) {
                 VideoCore::Nx2Debug::FinishCapture(id, {});
