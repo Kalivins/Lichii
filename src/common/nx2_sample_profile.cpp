@@ -127,8 +127,8 @@ void WriteModules(std::ofstream& file) {
 }
 
 /// Unwinds a suspended thread's stack. Allocates nothing: the thread may hold the heap lock.
-size_t Walk(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames) {
-    size_t depth = 0;
+size_t WalkUnguarded(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames,
+                     size_t& depth) {
     while (depth < MaxDepth && context.Rip != 0) {
         frames[depth++] = context.Rip;
         DWORD64 image_base{};
@@ -148,6 +148,22 @@ size_t Walk(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames) {
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
                          &handler_data, &establisher_frame, nullptr);
     }
+    return depth;
+}
+
+/// A thread stopped in driver or JIT code can leave the unwinder a garbage stack pointer: it then
+/// faults inside ntdll and took the whole emulator down (twice in Ocarina of Time sessions). Keep
+/// the frames found up to the fault instead.
+size_t Walk(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames) {
+    size_t depth = 0;
+#ifdef _MSC_VER
+    __try {
+        WalkUnguarded(context, frames, depth);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    WalkUnguarded(context, frames, depth);
+#endif
     return depth;
 }
 
