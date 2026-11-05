@@ -84,6 +84,20 @@ TEST_CASE("Event short timeouts do not return early", "[common][event]") {
     }
 }
 
+TEST_CASE("Event timeout expiry uses the steady clock", "[common][event]") {
+    Common::Event event;
+    for (const auto timeout : {100ms, 500ms}) {
+        for (int trial = 0; trial < 2; ++trial) {
+            const auto start = std::chrono::steady_clock::now();
+            const bool signalled = event.WaitFor(timeout);
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            CAPTURE(timeout, trial, elapsed);
+            CHECK_FALSE(signalled);
+            CHECK(elapsed >= timeout);
+        }
+    }
+}
+
 TEST_CASE("Event Set interrupts a long timed wait", "[common][event]") {
     Common::Event event;
     std::jthread setter([&] {

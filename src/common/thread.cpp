@@ -650,7 +650,9 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #ifdef _WIN32
     auto const& caps = Common::g_cpu_caps;
     if (caps.monitorx) {
-        const auto deadline = EventWaitDeadline(Common::g_wall_clock.GetTimeNS(), time);
+        const auto deadline = EventWaitDeadline(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()), time);
         const u64 ticks_per_second = Common::g_wall_clock.NsToTicks(std::chrono::seconds{1});
         while (true) {
             // Armed monitor, as per manual, MWAITX must be conditional if the condition isn't satisfied
@@ -658,7 +660,9 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
             _mm_monitorx(reinterpret_cast<u64*>(std::addressof(is_set)), 0, 0);
             if (!is_set.load()) {
                 const u32 cycles = MwaitxTimeoutCycles(
-                    deadline - Common::g_wall_clock.GetTimeNS(), ticks_per_second);
+                    deadline - std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch()),
+                    ticks_per_second);
                 if (cycles != 0) {
                     // See here: https://github.com/torvalds/linux/blob/948a64995aca6820abefd17f1a4258f5835c5ad9/arch/x86/lib/delay.c#L93
                     // MWAITX accepts a 32-bit input timer which determines the total number of cycles to wait for
