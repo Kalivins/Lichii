@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -28,6 +29,55 @@ class ImageView;
 class MemoryAllocator;
 class Sampler;
 class Scheduler;
+
+/// When FrameDump captures, and whether it reads the sampled textures back. Kept apart from the
+/// Vulkan side so it can be tested on its own.
+class FrameDumpSchedule {
+public:
+    enum class Step { None, Start, Finish };
+
+    /// EDEN_NX2_FRAME_DUMP_AT: seconds after boot ("45"), a frame number ("2700f"), or "file" to
+    /// capture once `trigger_file` exists.
+    void Configure(std::string_view at, std::filesystem::path trigger_file, bool sampled);
+    /// Captures the next frame for the debug server, which is told `id`. False while a capture
+    /// runs.
+    bool Arm(bool sampled, u64 id);
+    /// Once per presented frame: whether a capture starts with the next frame or has ended.
+    Step Tick(double elapsed_seconds);
+    /// The capture Tick started could not begin.
+    void Abort();
+
+    [[nodiscard]] bool Capturing() const noexcept {
+        return capturing;
+    }
+    [[nodiscard]] bool Sampled() const noexcept {
+        return sampled;
+    }
+    [[nodiscard]] u64 Frame() const noexcept {
+        return frame;
+    }
+    /// The debug server request being captured, 0 for EDEN_NX2_FRAME_DUMP's own capture.
+    [[nodiscard]] u64 CaptureId() const noexcept {
+        return capture_id;
+    }
+
+private:
+    void SetCapturing(bool value);
+
+    bool enabled{};
+    bool sampled{};
+    bool capturing{};
+    bool done{};
+    std::filesystem::path trigger_file;
+    u64 trigger_frame{~0ULL};
+    double trigger_seconds{std::numeric_limits<double>::infinity()};
+    u64 frame{};
+    u64 capture_id{};
+};
+
+/// Whether pipelines keep the textures each draw and dispatch samples: only while a capture that
+/// reads them back runs, so other frames skip the copies.
+[[nodiscard]] bool RecordingSampledTextures() noexcept;
 
 /// EDEN_NX2_FRAME_DUMP=<dir> reads back one whole frame: the color targets of every pass, the
 /// images written by every compute dispatch and the presented image. EDEN_NX2_FRAME_DUMP_AT picks
@@ -69,11 +119,11 @@ public:
     ~FrameDump();
 
     [[nodiscard]] bool Capturing() const noexcept {
-        return capturing;
+        return schedule.Capturing();
     }
 
     [[nodiscard]] bool CapturingSampled() const noexcept {
-        return capturing && sampled;
+        return schedule.Capturing() && schedule.Sampled();
     }
 
     /// Reads back the textures of the current draw not yet seen in this pass. Returns true when
@@ -123,6 +173,9 @@ public:
     /// Waits for pending readbacks and writes them once they pass the staging budget.
     void DrainIfFull();
     void TickFrame();
+    /// Captures the next frame into `directory` for the debug server, which is told `id` once
+    /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
+    void Arm(std::filesystem::path directory, bool sampled, u64 id);
 
 private:
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
@@ -177,22 +230,16 @@ private:
     void Write(const Job& job);
     void WriteBuffer(const Job& job);
     void WriteFile(const std::string& name, std::span<const u8> data);
+    void StopWriter();
 
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
 
-    bool enabled{};
-    bool sampled{};
-    bool capturing{};
-    bool done{};
+    FrameDumpSchedule schedule;
     bool truncated{};
     std::filesystem::path directory;
-    std::filesystem::path trigger_file;
-    u64 trigger_frame{~0ULL};
-    double trigger_seconds{};
     std::chrono::steady_clock::time_point start;
-    u64 frame{};
 
     std::ofstream manifest;
     static constexpr u32 MAX_PROBES = 8192;

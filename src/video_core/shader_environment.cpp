@@ -37,6 +37,7 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -650,6 +651,15 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         for (const u64 hash : {result->native_program_key, NativeShaderHash(lowered_code)}) {
             if (reject_hashes.find(fmt::format(",{:016x},", hash)) != std::string::npos) {
                 throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by EDEN_NX2_REJECT_HASH",
+                                           program_base, hash);
+            }
+        }
+    }
+    // The same list, changed at runtime by the debug server (docs/nx2/debug-mcp.md).
+    if (VideoCore::Nx2Debug::AnyRejected()) {
+        for (const u64 hash : {result->native_program_key, NativeShaderHash(lowered_code)}) {
+            if (VideoCore::Nx2Debug::IsRejected(hash)) {
+                throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by the debug server",
                                            program_base, hash);
             }
         }

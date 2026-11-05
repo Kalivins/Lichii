@@ -100,7 +100,7 @@ public:
         VideoCommon::SamplerId sampler;
     };
 
-    /// The sampled textures of the last configured draw, kept for EDEN_NX2_FRAME_DUMP_SAMPLED.
+    /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
     std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }

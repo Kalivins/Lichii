@@ -89,6 +89,10 @@ public:
     [[nodiscard]] bool HasPendingRemovals() const noexcept {
         return removal_pending.load(std::memory_order_acquire);
     }
+    /// Drops the native programs the debug server rejects so their next draw or dispatch lowers
+    /// them again (and fails); after an un-reject, forgets every rejection so they are retried.
+    /// Runs on the thread that owns the cache, between frames.
+    void RefreshDebugRejections(bool unrejected);
 
 protected:
     struct GraphicsEnvironments {
