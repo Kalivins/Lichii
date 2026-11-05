@@ -23,7 +23,27 @@ def extent(data, offset, size):
     return data[offset:offset + size]
 
 
-def zstd_decompress(data):
+def zstd_dictionary_id(data):
+    """The dictionary ID a zstd frame header names, or 0 when it names none."""
+    extent(data, 0, 6)
+    if data[:4] != bytes.fromhex("28b52ffd"):
+        raise ArchiveError("not a zstd frame")
+    descriptor = data[4]
+    size = (0, 1, 2, 4)[descriptor & 3]
+    offset = 5 + (0 if descriptor & 0x20 else 1)
+    return int.from_bytes(extent(data, offset, size), "little") if size else 0
+
+
+def zstd_decompress(data, dictionaries=None):
+    """Decompresses one zstd frame. `dictionaries` maps dictionary IDs to raw dictionary bytes
+    (load_zstd_dictionaries); a frame whose header names a dictionary needs it."""
+    dictionary_id = zstd_dictionary_id(data)
+    dictionary = None
+    if dictionary_id:
+        dictionary = (dictionaries or {}).get(dictionary_id)
+        if dictionary is None:
+            raise ArchiveError(f"zstd frame needs dictionary {dictionary_id:#x}; pass the game's "
+                               "dictionaries (Pack/ZsDic.pack.zs)")
     try:
         from compression import zstd
     except ImportError:
@@ -34,18 +54,50 @@ def zstd_decompress(data):
         if size > MAX_ALLOCATION:
             raise ArchiveError("unknown or excessive zstd decompressed size")
         output = ctypes.create_string_buffer(size)
-        library.ZSTD_decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
-        library.ZSTD_decompress.restype = ctypes.c_size_t
-        actual = library.ZSTD_decompress(output, size, data, len(data))
+        library.ZSTD_createDCtx.restype = ctypes.c_void_p
+        library.ZSTD_freeDCtx.argtypes = [ctypes.c_void_p]
+        library.ZSTD_decompress_usingDict.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                                      ctypes.c_void_p, ctypes.c_size_t,
+                                                      ctypes.c_void_p, ctypes.c_size_t]
+        library.ZSTD_decompress_usingDict.restype = ctypes.c_size_t
+        context = library.ZSTD_createDCtx()
+        try:
+            actual = library.ZSTD_decompress_usingDict(context, output, size, data, len(data),
+                                                       dictionary, len(dictionary or b""))
+        finally:
+            library.ZSTD_freeDCtx(context)
         if actual != size:
-            raise ArchiveError("zstd decompression failed; a dictionary may be required")
+            raise ArchiveError("zstd decompression failed")
         return output.raw[:actual]
     size = zstd.get_frame_info(data).decompressed_size
     if size is None or size > MAX_ALLOCATION:
         raise ArchiveError("unknown or excessive zstd decompressed size")
-    result = zstd.ZstdDecompressor().decompress(data, max_length=size + 1)
+    decoder = zstd.ZstdDecompressor(zstd.ZstdDict(dictionary) if dictionary else None)
+    result = decoder.decompress(data, max_length=size + 1)
     if len(result) != size:
         raise ArchiveError("zstd decompressed size mismatch")
+    return result
+
+
+def load_zstd_dictionaries(data):
+    """Reads a dictionary pack (Pack/ZsDic.pack.zs: a zstd frame holding a SARC of `.zsdic`
+    files) or one raw dictionary, and returns {dictionary ID: dictionary bytes}."""
+    from shader_archive import parse_sarc
+
+    if data[:4] == bytes.fromhex("28b52ffd"):
+        data = zstd_decompress(data)
+    members = parse_sarc(data) if data[:4] == b"SARC" else [("dictionary", data)]
+    result = {}
+    for name, payload in members:
+        # A zstd dictionary starts with its magic, then its ID.
+        if payload[:4] != bytes.fromhex("37a430ec") or len(payload) < 8:
+            if name.endswith(".zsdic") or name == "dictionary":
+                raise ArchiveError(f"{name} is not a zstd dictionary")
+            continue
+        dictionary_id, = struct.unpack_from("<I", payload, 4)
+        result[dictionary_id] = payload
+    if not result:
+        raise ArchiveError("no zstd dictionaries found")
     return result
 
 

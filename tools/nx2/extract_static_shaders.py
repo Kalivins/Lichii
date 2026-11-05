@@ -11,31 +11,33 @@ import re
 import sys
 
 from shader_archive import ArchiveError, find_bnsh, parse_bnsh, parse_sarc
-from shader_containers import MAX_ALLOCATION, dcx_decompress, parse_bnd4, parse_cgsb, parse_shn, zstd_decompress
+from shader_containers import (MAX_ALLOCATION, dcx_decompress, load_zstd_dictionaries, parse_bnd4,
+                               parse_cgsb, parse_shn, zstd_decompress)
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def walk_container(data, name, depth=0):
+def walk_container(data, name, depth=0, dictionaries=None):
     if depth > 12:
         raise ArchiveError("excessive container nesting")
     magic = data[:4]
     if magic == bytes.fromhex("28b52ffd"):
-        yield from walk_container(zstd_decompress(data), name + "!zstd", depth + 1)
+        yield from walk_container(zstd_decompress(data, dictionaries), name + "!zstd", depth + 1,
+                                  dictionaries)
     elif magic == b"DCX\0":
-        yield from walk_container(dcx_decompress(data), name + "!dcx", depth + 1)
+        yield from walk_container(dcx_decompress(data), name + "!dcx", depth + 1, dictionaries)
     elif magic in (b"SARC", b"BND4"):
         members = parse_sarc(data) if magic == b"SARC" else parse_bnd4(data)
         for member, payload in members:
             try:
-                yield from walk_container(payload, name + "!" + member, depth + 1)
+                yield from walk_container(payload, name + "!" + member, depth + 1, dictionaries)
             except (ArchiveError, ValueError) as exc:
                 yield {"member": name + "!" + member, "error": str(exc)}
     elif magic == b"FSHA":
         for offset, bnsh in find_bnsh(data):
-            yield from walk_container(bnsh, name + f"!BNSH@{offset:x}", depth + 1)
+            yield from walk_container(bnsh, name + f"!BNSH@{offset:x}", depth + 1, dictionaries)
     elif magic in (b"BNSH", b"CGSB", b"SHN!"):
         parser = {b"BNSH": parse_bnsh, b"CGSB": parse_cgsb, b"SHN!": parse_shn}[magic]
         for record in parser(data):
@@ -46,7 +48,7 @@ def walk_container(data, name, depth=0):
         raise ArchiveError(f"unsupported container magic {magic.hex()}")
 
 
-def extract(sources, output):
+def extract(sources, output, dictionaries=None):
     programs = {}
     archives = []
     errors = []
@@ -64,7 +66,7 @@ def extract(sources, output):
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise ArchiveError("source changed during read")
             archive = {**source, "size": len(data), "sha256": digest(data), "records": 0}
-            for record in walk_container(data, path.name):
+            for record in walk_container(data, path.name, dictionaries=dictionaries):
                 if "error" in record:
                     errors.append({**source, **record})
                     continue
@@ -105,6 +107,8 @@ def main():
     parser.add_argument("--source", action="append", default=[], metavar="TITLE_ID=PATH")
     parser.add_argument("--read-only-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--zstd-dictionaries", type=Path, metavar="ZSDIC",
+                        help="the game's zstd dictionary pack (Pack/ZsDic.pack.zs) or one .zsdic")
     args = parser.parse_args()
     library = args.read_only_root.resolve()
     output = args.output.resolve()
@@ -148,7 +152,9 @@ def main():
         if not re.fullmatch("[0-9a-fA-F]{16}", source["title_id"]):
             parser.error("invalid inventory title id")
     output.mkdir(parents=True, exist_ok=True)
-    result = extract(sources, output)
+    dictionaries = (load_zstd_dictionaries(args.zstd_dictionaries.read_bytes())
+                    if args.zstd_dictionaries else None)
+    result = extract(sources, output, dictionaries)
     result["errors"].extend(coverage_errors)
     (output / "manifest.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"archives": len(result["archives"]), "programs": len(result["programs"]),
