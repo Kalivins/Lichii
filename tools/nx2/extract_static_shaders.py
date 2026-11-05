@@ -12,7 +12,7 @@ import sys
 
 from shader_archive import ArchiveError, find_bnsh, parse_bnsh, parse_sarc
 from shader_containers import (MAX_ALLOCATION, dcx_decompress, load_zstd_dictionaries, parse_bnd4,
-                               parse_cgsb, parse_shn, zstd_decompress)
+                               parse_cgsb, parse_sharcb, parse_shn, zstd_decompress)
 
 
 def digest(data):
@@ -38,8 +38,9 @@ def walk_container(data, name, depth=0, dictionaries=None):
     elif magic == b"FSHA":
         for offset, bnsh in find_bnsh(data):
             yield from walk_container(bnsh, name + f"!BNSH@{offset:x}", depth + 1, dictionaries)
-    elif magic in (b"BNSH", b"CGSB", b"SHN!"):
-        parser = {b"BNSH": parse_bnsh, b"CGSB": parse_cgsb, b"SHN!": parse_shn}[magic]
+    elif magic in (b"BNSH", b"CGSB", b"SHN!", b"BAHS"):
+        parser = {b"BNSH": parse_bnsh, b"CGSB": parse_cgsb, b"SHN!": parse_shn,
+                  b"BAHS": parse_sharcb}[magic]
         for record in parser(data):
             yield {"member": name, **record}
     elif name.lower().endswith((".json", ".presetb", ".meminfo", ".tex", ".byml", ".yaml")):

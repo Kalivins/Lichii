@@ -3,6 +3,7 @@
 
 BND4 reference: SoulsFormatsNEXT, BinderFileHeader.ReadBinder4FileHeader (MIT).
 SHN/SHDROUNC and CGSB extents were checked against captured NVN2 files.
+The SHARCB ("BAHS") entry layout is inferred, not documented; parse_sharcb lists the evidence.
 """
 
 import ctypes
@@ -286,4 +287,75 @@ def parse_shn(data):
                                "control": control, "envelope": "unverified-shdrounc-slot", **origin})
     if not result:
         raise ArchiveError("SHDROUNC contains no supported shader records")
+    return result
+
+
+# agl shader type -> (NVN2 control stage, record stage); type 2 (geometry) was never observed.
+SHARCB_TYPES = {0: (0, "vertex"), 1: (1, "fragment"), 3: (5, "compute"), 4: (6, "task"), 5: (7, "mesh")}
+NVN2_CONTROL = bytes.fromhex("34127698c9000000")
+
+
+def parse_sharcb(data):
+    """Read every program entry of an agl SHARCB ("BAHS", version 0xb).
+
+    Header: u32 size at 8, code section size at 0x18, metadata size at 0x1c; the code section
+    follows the metadata. An entry is u32 size, u32 agl type, u32 0, u32 size - 0x10, then a body
+    of u64 code offset, u32 control size and an i32 control offset from the body. Most entries
+    hold their control at +0x68; the others point at a control shared with an earlier entry.
+    The allocation is control +0x44 bytes: code (+0x38), then constants, as in BNSH, where all
+    13,265 OoT programs have exactly that length. The entries of OoT's 13 SHARCBs attribute every
+    nonzero code byte without overlap and reference every control block, so both are enforced
+    here instead of trusting the scan.
+    """
+    extent(data, 0, 32)
+    if data[:4] != b"BAHS" or struct.unpack_from("<I", data, 4)[0] != 0xb:
+        raise ArchiveError("unsupported SHARCB version")
+    size, = struct.unpack_from("<I", data, 8)
+    code_size, metadata_size = struct.unpack_from("<II", data, 0x18)
+    if size != len(data) or metadata_size < 32 or metadata_size + code_size != size:
+        raise ArchiveError("invalid SHARCB section sizes")
+    metadata, code = data[:metadata_size], data[metadata_size:]
+    words = struct.unpack_from(f"<{metadata_size // 4}I", metadata)
+    result, allocations, used = [], {}, set()
+    for index in range(8, len(words) - 8):
+        entry_size, agl_type, zero, body = words[index:index + 4]
+        if zero or body != entry_size - 0x10 or agl_type not in SHARCB_TYPES:
+            continue
+        entry = index * 4
+        code_offset, control_size, relative = struct.unpack_from("<QIi", metadata, entry + 0x10)
+        control_offset = entry + 0x10 + relative
+        if (not 0xe0 <= control_size <= 0x200 or control_offset < 0 or
+                metadata[control_offset:control_offset + 8] != NVN2_CONTROL):
+            continue
+        control = extent(metadata, control_offset, control_size)
+        program_size, allocation = struct.unpack_from("<I8xI", control, 0x38)
+        if not 0 < program_size <= allocation:
+            raise ArchiveError(f"SHARCB entry {entry:#x} has invalid code sizes")
+        program = extent(code, code_offset, allocation)
+        control_stage, stage = SHARCB_TYPES[agl_type]
+        if struct.unpack_from("<I", control, 0x54)[0] >> 16 != control_stage:
+            raise ArchiveError(f"SHARCB entry {entry:#x} type disagrees with its control stage")
+        origin = {"entry_offset": entry, "code_offset": code_offset, "control_offset": control_offset}
+        if stage in ("vertex", "fragment"):
+            item = graphics_record(program, control, **origin)
+            if item["stage"] != stage:
+                raise ArchiveError(f"SHARCB entry {entry:#x} type disagrees with native header")
+            result.append(item)
+        else:
+            result.append({"stage": stage, "code": program, "control": control,
+                           "envelope": f"unverified-{stage}", **origin})
+        allocations[code_offset] = max(allocations.get(code_offset, 0), allocation)
+        used.add(control_offset)
+    controls = {offset for offset in range(len(metadata)) if metadata.startswith(NVN2_CONTROL, offset)}
+    if controls - used:
+        raise ArchiveError(f"SHARCB has {len(controls - used)} control blocks without an entry")
+    end = 0
+    for offset in sorted(allocations) + [len(code)]:
+        if offset < end:
+            raise ArchiveError(f"SHARCB allocations overlap at {offset:#x}")
+        if any(code[end:offset]):
+            raise ArchiveError(f"SHARCB code {end:#x}..{offset:#x} belongs to no entry")
+        end = offset + allocations.get(offset, 0)
+    if not result:
+        raise ArchiveError("SHARCB contains no supported shader records")
     return result

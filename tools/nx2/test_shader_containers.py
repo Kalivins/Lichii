@@ -9,7 +9,8 @@ import unittest
 import zlib
 
 from shader_archive import ArchiveError
-from shader_containers import dcx_decompress, lz4_block, parse_bnd4, parse_cgsb, parse_shn
+from extract_static_shaders import walk_container
+from shader_containers import dcx_decompress, lz4_block, parse_bnd4, parse_cgsb, parse_sharcb, parse_shn
 
 
 def graphics(stage):
@@ -23,6 +24,32 @@ def cgsb(stage=0):
     record = b"NVN \1\0\0\0" + bytes(8)
     record += struct.pack("<8Q", 104, len(code), 104 + len(code), len(control), 0, 0, 0, 0)
     return header + record + code + control
+
+
+def sharcb(entries, metadata_tail=b"", code_tail=b""):
+    """entries: (agl type, control stage, allocation, index of the entry whose control is shared)."""
+    metadata, code, controls = bytearray(0x40), bytearray(), []
+    for agl_type, stage, allocation, shared in entries:
+        offset, entry = len(code), len(metadata)
+        code += allocation + bytes(-len(allocation) % 0x100)
+        if shared is None:
+            control = bytearray(0xe0)
+            control[:8] = bytes.fromhex("34127698c9000000")
+            struct.pack_into("<I4xII", control, 0x38, min(len(allocation), 144), len(allocation),
+                             len(allocation))
+            struct.pack_into("<I", control, 0x54, stage << 16)
+            metadata += struct.pack("<4IQIi", 0x158, agl_type, 0, 0x148, offset, 0xe0, 0x68)
+            metadata += bytes(0x58) + control
+            controls.append(entry + 0x78)
+        else:
+            relative = controls[shared] - (entry + 0x10)
+            metadata += struct.pack("<4IQIi", 0x40, agl_type, 0, 0x30, offset, 0xe0, relative) + bytes(0x20)
+            controls.append(controls[shared])
+    metadata += metadata_tail + bytes(-len(metadata_tail) % 4)
+    code += code_tail
+    struct.pack_into("<4sII", metadata, 0, b"BAHS", 0xb, len(metadata) + len(code))
+    struct.pack_into("<II", metadata, 0x18, len(code), len(metadata))
+    return bytes(metadata + code)
 
 
 def literals(data):
@@ -143,6 +170,32 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(records[0]["stage"], "vertex")
         self.assertEqual(records[1]["stage"], "unknown-shdrounc-slot-3")
         self.assertEqual(records[1]["envelope"], "unverified-shdrounc-slot")
+
+    def test_sharcb_reads_inline_and_shared_controls_with_constants(self):
+        vertex = graphics(0) + b"\1" * 16
+        data = sharcb([(0, 0, vertex, None), (1, 1, graphics(4), None), (3, 5, b"\7" * 0x100, None),
+                       (0, 0, graphics(0) + b"\2" * 16, 0)])
+        records = parse_sharcb(data)
+        self.assertEqual([r["stage"] for r in records], ["vertex", "fragment", "compute", "vertex"])
+        self.assertEqual(records[0]["code"], vertex)
+        self.assertEqual(records[2]["envelope"], "unverified-compute")
+        self.assertEqual(records[3]["control"], records[0]["control"])
+        self.assertEqual(records[3]["control_offset"], records[0]["control_offset"])
+        self.assertNotEqual(records[3]["code"], records[0]["code"])
+        walked = list(walk_container(data, "agl_technique_pfx.sharcb"))
+        self.assertEqual([r["member"] for r in walked], ["agl_technique_pfx.sharcb"] * 4)
+
+    def test_sharcb_refuses_what_its_entries_do_not_explain(self):
+        entries = [(0, 0, graphics(0), None), (1, 1, graphics(4), None)]
+        parse_sharcb(sharcb(entries))
+        orphan = bytes.fromhex("34127698c9000000")
+        for data in (sharcb(entries, code_tail=b"\1"),
+                     sharcb(entries, metadata_tail=bytes(8) + orphan),
+                     sharcb([(1, 0, graphics(0), None)]),
+                     sharcb([(0, 0, graphics(4), None)]),
+                     sharcb(entries)[:-1]):
+            with self.assertRaises(ArchiveError):
+                parse_sharcb(data)
 
     def test_inventory_omissions_are_reported_instead_of_empty_success(self):
         with tempfile.TemporaryDirectory() as temporary:
