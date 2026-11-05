@@ -295,60 +295,111 @@ SHARCB_TYPES = {0: (0, "vertex"), 1: (1, "fragment"), 3: (5, "compute"), 4: (6, 
 NVN2_CONTROL = bytes.fromhex("34127698c9000000")
 
 
-def parse_sharcb(data):
-    """Read every program entry of an agl SHARCB ("BAHS", version 0xb).
+def sharcb_entry(metadata, code, entry):
+    entry_size, agl_type, zero, body = struct.unpack_from("<4I", extent(metadata, entry, 0x20))
+    if zero or entry_size < 0x20 or body != entry_size - 0x10 or agl_type not in SHARCB_TYPES:
+        raise ArchiveError(f"SHARCB entry {entry:#x} has an unsupported header")
+    code_offset, control_size, relative = struct.unpack_from("<QIi", metadata, entry + 0x10)
+    control_offset = entry + 0x10 + relative
+    control = extent(metadata, control_offset, control_size)
+    if control_size < 0x58 or control[:8] != NVN2_CONTROL:
+        raise ArchiveError(f"SHARCB entry {entry:#x} does not point at an NVN2 control block")
+    program_size, allocation = struct.unpack_from("<I8xI", control, 0x38)
+    if not 0 < program_size <= allocation:
+        raise ArchiveError(f"SHARCB entry {entry:#x} has invalid code sizes")
+    program = extent(code, code_offset, allocation)
+    control_stage, stage = SHARCB_TYPES[agl_type]
+    if struct.unpack_from("<I", control, 0x54)[0] >> 16 != control_stage:
+        raise ArchiveError(f"SHARCB entry {entry:#x} type disagrees with its control stage")
+    origin = {"entry_offset": entry, "code_offset": code_offset, "control_offset": control_offset}
+    if stage not in ("vertex", "fragment"):
+        return entry_size, agl_type, {"stage": stage, "code": program, "control": control,
+                                      "envelope": f"unverified-{stage}", **origin}
+    item = graphics_record(program, control, **origin)
+    if item["stage"] != stage:
+        raise ArchiveError(f"SHARCB entry {entry:#x} type disagrees with native header")
+    return entry_size, agl_type, item
 
-    Header: u32 size at 8, code section size at 0x18, metadata size at 0x1c; the code section
-    follows the metadata. An entry is u32 size, u32 agl type, u32 0, u32 size - 0x10, then a body
-    of u64 code offset, u32 control size and an i32 control offset from the body. Most entries
-    hold their control at +0x68; the others point at a control shared with an earlier entry.
+
+def sharcb_programs(metadata, table):
+    """Yield (name, agl types, first entry, variations) from the program table."""
+    table_size, count = struct.unpack_from("<II", extent(metadata, table, 8))
+    offset = table + 8
+    for _ in range(count):
+        size, name_length, stages, first = struct.unpack_from("<4I", extent(metadata, offset, 16))
+        name = extent(metadata, offset + 16, name_length)
+        macros = offset + 16 + name_length
+        if size < 16 + name_length + 8 or not name.endswith(b"\0") or stages >> 6 or not stages:
+            raise ArchiveError(f"SHARCB program {offset:#x} has an unsupported header")
+        list_size, macro_count = struct.unpack_from("<II", extent(metadata, macros, 8))
+        variations, macro = 1, macros + 8
+        for _ in range(macro_count):
+            macro_size, _, values = struct.unpack_from("<3I", extent(metadata, macro, 12))
+            variations *= values
+            macro += macro_size
+        if macro != macros + list_size or macro > offset + size:
+            raise ArchiveError(f"SHARCB program {offset:#x} has an invalid macro list")
+        types = [index for index in range(6) if stages >> index & 1]
+        yield name[:-1].decode("ascii"), types, first, variations
+        offset += size
+    if offset != table + table_size:
+        raise ArchiveError("SHARCB program table size disagrees with its programs")
+
+
+def parse_sharcb(data):
+    """Read every program entry of an agl SHARCB ("BAHS", version 0xb), named by its program.
+
+    Header: string table at 0x150 sized by u32 0x14, code section size at 0x18, metadata size
+    at 0x1c; the code section follows the metadata. After the strings come the entry table and
+    the program table, each u32 size and u32 count. An entry is u32 size, u32 agl type, u32 0,
+    u32 size - 0x10, then u64 code offset, u32 control size and an i32 control offset from that
+    body, at +0x68 or at a control shared with an earlier entry. A program is u32 size, u32 name
+    length, u32 agl type mask, u32 first entry, its name, then three macro lists; the first one
+    multiplies into its variations, and its entries are variation-major, stage-minor.
     The allocation is control +0x44 bytes: code (+0x38), then constants, as in BNSH, where all
-    13,265 OoT programs have exactly that length. The entries of OoT's 13 SHARCBs attribute every
-    nonzero code byte without overlap and reference every control block, so both are enforced
-    here instead of trusting the scan.
+    13,265 OoT programs have exactly that length. In OoT's 13 SHARCBs the programs cover the
+    entries exactly, the entries attribute every nonzero code byte without overlap and use every
+    control block; all of it is enforced, so a misread is an error instead of a partial manifest.
+    The order of macros inside a variation index is not established; records keep the index.
     """
-    extent(data, 0, 32)
+    extent(data, 0, 0x150)
     if data[:4] != b"BAHS" or struct.unpack_from("<I", data, 4)[0] != 0xb:
         raise ArchiveError("unsupported SHARCB version")
     size, = struct.unpack_from("<I", data, 8)
-    code_size, metadata_size = struct.unpack_from("<II", data, 0x18)
-    if size != len(data) or metadata_size < 32 or metadata_size + code_size != size:
+    strings, code_size, metadata_size = struct.unpack_from("<III", data, 0x14)
+    if size != len(data) or metadata_size < 0x150 + strings or metadata_size + code_size != size:
         raise ArchiveError("invalid SHARCB section sizes")
     metadata, code = data[:metadata_size], data[metadata_size:]
-    words = struct.unpack_from(f"<{metadata_size // 4}I", metadata)
-    result, allocations, used = [], {}, set()
-    for index in range(8, len(words) - 8):
-        entry_size, agl_type, zero, body = words[index:index + 4]
-        if zero or body != entry_size - 0x10 or agl_type not in SHARCB_TYPES:
-            continue
-        entry = index * 4
-        code_offset, control_size, relative = struct.unpack_from("<QIi", metadata, entry + 0x10)
-        control_offset = entry + 0x10 + relative
-        if (not 0xe0 <= control_size <= 0x200 or control_offset < 0 or
-                metadata[control_offset:control_offset + 8] != NVN2_CONTROL):
-            continue
-        control = extent(metadata, control_offset, control_size)
-        program_size, allocation = struct.unpack_from("<I8xI", control, 0x38)
-        if not 0 < program_size <= allocation:
-            raise ArchiveError(f"SHARCB entry {entry:#x} has invalid code sizes")
-        program = extent(code, code_offset, allocation)
-        control_stage, stage = SHARCB_TYPES[agl_type]
-        if struct.unpack_from("<I", control, 0x54)[0] >> 16 != control_stage:
-            raise ArchiveError(f"SHARCB entry {entry:#x} type disagrees with its control stage")
-        origin = {"entry_offset": entry, "code_offset": code_offset, "control_offset": control_offset}
-        if stage in ("vertex", "fragment"):
-            item = graphics_record(program, control, **origin)
-            if item["stage"] != stage:
-                raise ArchiveError(f"SHARCB entry {entry:#x} type disagrees with native header")
-            result.append(item)
-        else:
-            result.append({"stage": stage, "code": program, "control": control,
-                           "envelope": f"unverified-{stage}", **origin})
-        allocations[code_offset] = max(allocations.get(code_offset, 0), allocation)
-        used.add(control_offset)
-    controls = {offset for offset in range(len(metadata)) if metadata.startswith(NVN2_CONTROL, offset)}
-    if controls - used:
-        raise ArchiveError(f"SHARCB has {len(controls - used)} control blocks without an entry")
+    table = 0x150 + strings
+    table_size, count = struct.unpack_from("<II", extent(metadata, table, 8))
+    entries, offset = [], table + 8
+    for _ in range(count):
+        entry_size, agl_type, record = sharcb_entry(metadata, code, offset)
+        entries.append((agl_type, record))
+        offset += entry_size
+    if offset != table + table_size:
+        raise ArchiveError("SHARCB entry table size disagrees with its entries")
+    result = []
+    for name, types, first, variations in sharcb_programs(metadata, offset):
+        if first != len(result):
+            raise ArchiveError(f"SHARCB program {name} does not start after the previous one")
+        for index in range(len(types) * variations):
+            if first + index >= count or entries[first + index][0] != types[index % len(types)]:
+                raise ArchiveError(f"SHARCB program {name} disagrees with its entries")
+            result.append({"program": name, "variation": index // len(types),
+                           **entries[first + index][1]})
+    if len(result) != count:
+        raise ArchiveError("SHARCB programs do not cover every entry")
+    used = {record["control_offset"] for record in result}
+    found = metadata.find(NVN2_CONTROL)
+    while found >= 0:
+        if found not in used:
+            raise ArchiveError(f"SHARCB control block {found:#x} has no entry")
+        found = metadata.find(NVN2_CONTROL, found + 1)
+    allocations = {}
+    for record in result:
+        allocations[record["code_offset"]] = max(allocations.get(record["code_offset"], 0),
+                                                 len(record["code"]))
     end = 0
     for offset in sorted(allocations) + [len(code)]:
         if offset < end:

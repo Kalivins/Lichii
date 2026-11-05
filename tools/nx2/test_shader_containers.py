@@ -26,11 +26,12 @@ def cgsb(stage=0):
     return header + record + code + control
 
 
-def sharcb(entries, metadata_tail=b"", code_tail=b""):
-    """entries: (agl type, control stage, allocation, index of the entry whose control is shared)."""
-    metadata, code, controls = bytearray(0x40), bytearray(), []
+def sharcb(entries, programs, metadata_tail=b"", code_tail=b""):
+    """entries: (agl type, control stage, allocation, index of the entry whose control is shared);
+    programs: (name, agl type mask, first entry, value count of each variation macro)."""
+    table, code, controls = bytearray(), bytearray(), []
     for agl_type, stage, allocation, shared in entries:
-        offset, entry = len(code), len(metadata)
+        offset, entry = len(code), 0x168 + len(table)
         code += allocation + bytes(-len(allocation) % 0x100)
         if shared is None:
             control = bytearray(0xe0)
@@ -38,17 +39,27 @@ def sharcb(entries, metadata_tail=b"", code_tail=b""):
             struct.pack_into("<I4xII", control, 0x38, min(len(allocation), 144), len(allocation),
                              len(allocation))
             struct.pack_into("<I", control, 0x54, stage << 16)
-            metadata += struct.pack("<4IQIi", 0x158, agl_type, 0, 0x148, offset, 0xe0, 0x68)
-            metadata += bytes(0x58) + control
+            table += struct.pack("<4IQIi", 0x158, agl_type, 0, 0x148, offset, 0xe0, 0x68)
+            table += bytes(0x58) + control
             controls.append(entry + 0x78)
         else:
             relative = controls[shared] - (entry + 0x10)
-            metadata += struct.pack("<4IQIi", 0x40, agl_type, 0, 0x30, offset, 0xe0, relative) + bytes(0x20)
+            table += struct.pack("<4IQIi", 0x40, agl_type, 0, 0x30, offset, 0xe0, relative) + bytes(0x20)
             controls.append(controls[shared])
+    records = bytearray()
+    for name, mask, first, values in programs:
+        macros = b"".join(struct.pack("<4I", 16 + 2 + 2 * count, 2, count, 0) + b"M\0" + b"v\0" * count
+                          for count in values)
+        body = name.encode() + b"\0" + struct.pack("<II", 8 + len(macros), len(values)) + macros
+        body += struct.pack("<II", 8, 0) * 2
+        records += struct.pack("<4I", 16 + len(body), len(name) + 1, mask, first) + body
+    metadata = bytearray(0x150) + b"pass\0".ljust(0x18, b"\0")
+    metadata += struct.pack("<II", 8 + len(table), len(entries)) + table
+    metadata += struct.pack("<II", 8 + len(records), len(programs)) + records
     metadata += metadata_tail + bytes(-len(metadata_tail) % 4)
     code += code_tail
     struct.pack_into("<4sII", metadata, 0, b"BAHS", 0xb, len(metadata) + len(code))
-    struct.pack_into("<II", metadata, 0x18, len(code), len(metadata))
+    struct.pack_into("<III", metadata, 0x14, 0x18, len(code), len(metadata))
     return bytes(metadata + code)
 
 
@@ -171,29 +182,39 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(records[1]["stage"], "unknown-shdrounc-slot-3")
         self.assertEqual(records[1]["envelope"], "unverified-shdrounc-slot")
 
-    def test_sharcb_reads_inline_and_shared_controls_with_constants(self):
+    def test_sharcb_names_inline_and_shared_controls_with_constants(self):
         vertex = graphics(0) + b"\1" * 16
-        data = sharcb([(0, 0, vertex, None), (1, 1, graphics(4), None), (3, 5, b"\7" * 0x100, None),
-                       (0, 0, graphics(0) + b"\2" * 16, 0)])
+        entries = [(0, 0, vertex, None), (1, 1, graphics(4), None),
+                   (0, 0, graphics(0) + b"\2" * 16, 0), (1, 1, graphics(4)[:136] + b"\3" * 8, 1),
+                   (3, 5, b"\7" * 0x100, None)]
+        data = sharcb(entries, [("bloom_mask", 3, 0, [2]), ("smaac_utility", 8, 4, [])])
         records = parse_sharcb(data)
-        self.assertEqual([r["stage"] for r in records], ["vertex", "fragment", "compute", "vertex"])
+        self.assertEqual([(r["program"], r["variation"], r["stage"]) for r in records],
+                         [("bloom_mask", 0, "vertex"), ("bloom_mask", 0, "fragment"),
+                          ("bloom_mask", 1, "vertex"), ("bloom_mask", 1, "fragment"),
+                          ("smaac_utility", 0, "compute")])
         self.assertEqual(records[0]["code"], vertex)
-        self.assertEqual(records[2]["envelope"], "unverified-compute")
-        self.assertEqual(records[3]["control"], records[0]["control"])
-        self.assertEqual(records[3]["control_offset"], records[0]["control_offset"])
-        self.assertNotEqual(records[3]["code"], records[0]["code"])
+        self.assertEqual(records[4]["envelope"], "unverified-compute")
+        self.assertEqual(records[2]["control"], records[0]["control"])
+        self.assertEqual(records[2]["control_offset"], records[0]["control_offset"])
+        self.assertNotEqual(records[2]["code"], records[0]["code"])
         walked = list(walk_container(data, "agl_technique_pfx.sharcb"))
-        self.assertEqual([r["member"] for r in walked], ["agl_technique_pfx.sharcb"] * 4)
+        self.assertEqual([r["member"] for r in walked], ["agl_technique_pfx.sharcb"] * 5)
 
-    def test_sharcb_refuses_what_its_entries_do_not_explain(self):
+    def test_sharcb_refuses_what_its_tables_do_not_explain(self):
         entries = [(0, 0, graphics(0), None), (1, 1, graphics(4), None)]
-        parse_sharcb(sharcb(entries))
+        pair = [("pass", 3, 0, [])]
+        parse_sharcb(sharcb(entries, pair))
         orphan = bytes.fromhex("34127698c9000000")
-        for data in (sharcb(entries, code_tail=b"\1"),
-                     sharcb(entries, metadata_tail=bytes(8) + orphan),
-                     sharcb([(1, 0, graphics(0), None)]),
-                     sharcb([(0, 0, graphics(4), None)]),
-                     sharcb(entries)[:-1]):
+        for data in (sharcb(entries, pair, code_tail=b"\1"),
+                     sharcb(entries, pair, metadata_tail=bytes(8) + orphan),
+                     sharcb([(1, 0, graphics(0), None)], [("pass", 2, 0, [])]),
+                     sharcb([(0, 0, graphics(4), None)], [("pass", 1, 0, [])]),
+                     sharcb(entries, [("pass", 3, 0, [2])]),
+                     sharcb(entries, [("pass", 1, 0, []), ("next", 2, 0, [])]),
+                     sharcb(entries, [("pass", 1, 0, [])]),
+                     sharcb(entries, [("pass", 2, 0, [])]),
+                     sharcb(entries, pair)[:-1]):
             with self.assertRaises(ArchiveError):
                 parse_sharcb(data)
 
