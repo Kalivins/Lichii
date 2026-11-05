@@ -194,10 +194,11 @@ struct LoggedMachine {
                     if (mask & (1U << i))
                         predicates[i] = (value >> i) & 1;
             } else if ((word & 0xfff0000000000000ULL) == 0x5b60000000000000ULL) {
-                REQUIRE((bits(49, 3) == 5 || bits(49, 3) == 6));
+                REQUIRE((bits(49, 3) == 1 || bits(49, 3) == 5 || bits(49, 3) == 6));
                 REQUIRE(bits(45, 2) == 0);
                 REQUIRE(bits(0, 3) == 7);
-                const bool result = bits(49, 3) == 5 ? Read(0, a) != Read(0, b)
+                const bool result = bits(49, 3) == 1 ? Read(0, a) < Read(0, b)
+                                    : bits(49, 3) == 5 ? Read(0, a) != Read(0, b)
                                     : bits(48, 1)    ? s32(Read(0, a)) >= s32(Read(0, b))
                                                      : Read(0, a) >= Read(0, b);
                 const u32 output = bits(3, 3);
@@ -254,6 +255,8 @@ struct LoggedMachine {
                 write(0, static_cast<u32>(sum));
                 if (bits(47, 1))
                     carry = sum >> 32;
+            } else if ((word >> 56) == 0x1c) {
+                write(0, Read(0, a) + static_cast<u32>(bits(20, 32)));
             } else if (((word >> 48) & 0xfffe) == 0x5c18) {
                 write(0, (Read(0, a) << bits(39, 5)) + Read(0, b));
             } else if ((word & 0xfff0000000000000ULL) == 0xe240000000000000ULL) {
@@ -972,6 +975,53 @@ TEST_CASE(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+TEST_CASE("Ocarina uniform immediate add carries through any UP and preserves the rest",
+          "[video_core][ampere][fast_fusion_logged]") {
+    // UIADD3 UR12, UR12, 0x10 with the carry out in UP4, from Ocarina of Time.
+    constexpr Instruction captured{{0x0c0c7890, 0x00000010, 0x0ff9e03f, 0x000fc400}};
+    constexpr u32 ur12 = 228;
+    constexpr std::array values{0U, 1U, 0xffffffefU, 0xfffffff0U, 0xffffffffU};
+    for (u32 up = 0; up < 7; ++up) {
+        const u32 mask = 1U << (6 - up);
+        auto carry_out = captured;
+        carry_out.words[2] = (carry_out.words[2] & ~(7U << 17)) | (up << 17);
+        auto carry_in = captured;
+        carry_in.words[2] = (carry_in.words[2] & ~(0xfU << 23)) | (7U << 17) | (1U << 10) | (up << 23);
+        const auto lowered_out = LowerToMaxwell(std::array{carry_out, Exit});
+        const auto lowered_in = LowerToMaxwell(std::array{carry_in, Exit});
+        CAPTURE(up);
+        INFO(lowered_out.error);
+        INFO(lowered_in.error);
+        REQUIRE(lowered_out);
+        REQUIRE(lowered_in);
+        LoggedMachine machine;
+        for (u32 a : values) {
+            for (u32 packed : {0x12340015U, 0x1234006aU}) {
+                machine.registers[0][ur12] = a;
+                machine.registers[0][239] = packed;
+                const auto before = machine.registers[0];
+                const auto predicates = machine.predicates;
+                machine.Run(lowered_out.instructions);
+                CAPTURE(a, packed);
+                const bool carried = u64{a} + 0x10 > 0xffffffffULL;
+                for (u32 reg = 0; reg < 246; ++reg)
+                    CHECK(machine.registers[0][reg] ==
+                          (reg == ur12  ? a + 0x10U
+                           : reg == 239 ? (packed & ~mask) | (carried ? mask : 0)
+                                        : before[reg]));
+                CHECK(machine.predicates == predicates);
+
+                machine.registers[0][ur12] = a;
+                machine.registers[0][239] = packed;
+                machine.Run(lowered_in.instructions);
+                CHECK(machine.registers[0][ur12] == a + 0x10U + ((packed & mask) != 0 ? 1U : 0U));
+                CHECK(machine.registers[0][239] == packed);
+                CHECK(machine.predicates == predicates);
             }
         }
     }
