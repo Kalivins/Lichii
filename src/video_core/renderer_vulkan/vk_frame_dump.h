@@ -37,11 +37,12 @@ public:
     enum class Step { None, Start, Finish };
 
     /// EDEN_NX2_FRAME_DUMP_AT: seconds after boot ("45"), a frame number ("2700f"), or "file" to
-    /// capture once `trigger_file` exists.
+    /// capture once `trigger_file` exists. EDEN_NX2_FRAME_DUMP_SAMPLED reads back both the
+    /// sampled textures and the bound buffers.
     void Configure(std::string_view at, std::filesystem::path trigger_file, bool sampled);
     /// Captures the next frame for the debug server, which is told `id`. False while a capture
     /// runs.
-    bool Arm(bool sampled, u64 id);
+    bool Arm(bool sampled, bool buffers, u64 id);
     /// Once per presented frame: whether a capture starts with the next frame or has ended.
     Step Tick(double elapsed_seconds);
     /// The capture Tick started could not begin.
@@ -52,6 +53,10 @@ public:
     }
     [[nodiscard]] bool Sampled() const noexcept {
         return sampled;
+    }
+    /// Whether the uniform and storage buffers and dispatch group counts are recorded.
+    [[nodiscard]] bool Buffers() const noexcept {
+        return buffers;
     }
     [[nodiscard]] u64 Frame() const noexcept {
         return frame;
@@ -66,6 +71,7 @@ private:
 
     bool enabled{};
     bool sampled{};
+    bool buffers{};
     bool capturing{};
     bool done{};
     std::filesystem::path trigger_file;
@@ -126,6 +132,10 @@ public:
         return schedule.Capturing() && schedule.Sampled();
     }
 
+    [[nodiscard]] bool CapturingBuffers() const noexcept {
+        return schedule.Capturing() && schedule.Buffers();
+    }
+
     /// Reads back the textures of the current draw not yet seen in this pass. Returns true when
     /// copies were recorded, which ends the current render pass.
     bool NoteSampled(std::span<const Sampled> textures);
@@ -175,7 +185,7 @@ public:
     void TickFrame();
     /// Captures the next frame into `directory` for the debug server, which is told `id` once
     /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
-    void Arm(std::filesystem::path directory, bool sampled, u64 id);
+    void Arm(std::filesystem::path directory, bool sampled, bool buffers, u64 id);
 
 private:
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };

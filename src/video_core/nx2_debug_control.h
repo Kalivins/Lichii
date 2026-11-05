@@ -22,9 +22,24 @@ struct CaptureRequest {
     u64 id;
     std::filesystem::path directory;
     bool sampled;
+    /// The uniform and storage buffers of every draw and dispatch, and dispatch group counts.
+    bool buffers;
 };
 
 struct CaptureResult {
+    std::string error;
+};
+
+struct GpuReadRequest {
+    u64 id;
+    u64 gpu_address;
+    u64 size;
+};
+
+struct GpuReadResult {
+    std::vector<u8> bytes;
+    /// Tegra::MemoryManager::GetID of the address space that maps the whole range.
+    u64 address_space;
     std::string error;
 };
 
@@ -52,6 +67,18 @@ void CancelCapture(u64 id);
 [[nodiscard]] std::optional<CaptureRequest> TakeCapture();
 /// Frame dump writer thread, once the manifest summary is written (or the capture failed).
 void FinishCapture(u64 id, CaptureResult result);
+
+/// Server thread: queues a read of GPU virtual memory; the rasterizer takes it at the next frame
+/// end, where the GPU's own reads of its address spaces run.
+void RequestGpuRead(GpuReadRequest request);
+/// Server thread: withdraws a read that was not taken yet (it timed out).
+void CancelGpuRead(u64 id);
+/// Server thread: empty on timeout or when the session ends.
+[[nodiscard]] std::optional<GpuReadResult> WaitGpuRead(u64 id, std::chrono::milliseconds timeout);
+/// Rasterizer thread.
+[[nodiscard]] std::optional<GpuReadRequest> TakeGpuRead();
+/// Rasterizer thread.
+void FinishGpuRead(u64 id, GpuReadResult result);
 
 /// Server thread: adds or removes native program keys or shader hashes (as EDEN_NX2_REJECT_HASH
 /// takes them). Returns the generation to wait for.

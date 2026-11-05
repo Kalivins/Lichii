@@ -28,13 +28,19 @@ struct Endpoint {
 /// Parses EDEN_NX2_DEBUG_SERVER: "<port>" or "<host>:<port>". Only loopback hosts are accepted.
 [[nodiscard]] std::optional<Endpoint> ParseEndpoint(std::string_view text, std::string& error);
 
+/// Whether the client of the request being handled has disconnected. A handler that waits polls
+/// it to undo what it started (input injection releases its buttons).
+using ClientGone = std::function<bool()>;
+
 /// A tool: takes the request's params, returns its result, throws std::exception on failure.
-using Handler = std::function<nlohmann::json(const nlohmann::json& params)>;
+using Handler =
+    std::function<nlohmann::json(const nlohmann::json& params, const ClientGone& client_gone)>;
 using Handlers = std::map<std::string, Handler, std::less<>>;
 
 /// Answers one request line, {"id":..,"method":..,"params":{..}}, with one response line (no
 /// newline): {"id":..,"result":..} or {"id":..,"error":"..."}.
-[[nodiscard]] std::string HandleRequest(const Handlers& handlers, std::string_view line);
+[[nodiscard]] std::string HandleRequest(const Handlers& handlers, std::string_view line,
+                                        const ClientGone& client_gone = [] { return false; });
 
 [[nodiscard]] std::string Base64(std::span<const u8> data);
 

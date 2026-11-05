@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <charconv>
 #include <thread>
 
@@ -34,7 +35,9 @@ public:
                 if (!line.empty() && line.back() == '\r') {
                     line.remove_suffix(1);
                 }
-                self->output = line.empty() ? std::string{} : HandleRequest(self->handlers, line);
+                self->output = line.empty() ? std::string{}
+                                            : HandleRequest(self->handlers, line,
+                                                            [&self] { return self->ClientGone(); });
                 self->input.erase(0, length);
                 if (self->output.empty()) {
                     self->Read();
@@ -46,6 +49,16 @@ public:
     }
 
 private:
+    /// A non-blocking peek: end of stream or a reset means the client left.
+    bool ClientGone() {
+        boost::system::error_code error;
+        socket.non_blocking(true, error);
+        std::array<char, 1> byte;
+        const size_t length = socket.receive(boost::asio::buffer(byte),
+                                             tcp::socket::message_peek, error);
+        return error ? error != boost::asio::error::would_block : length == 0;
+    }
+
     void Write() {
         boost::asio::async_write(
             socket, boost::asio::buffer(output),
@@ -93,7 +106,8 @@ std::optional<Endpoint> ParseEndpoint(std::string_view text, std::string& error)
     return Endpoint{std::string{host}, static_cast<u16>(port)};
 }
 
-std::string HandleRequest(const Handlers& handlers, std::string_view line) {
+std::string HandleRequest(const Handlers& handlers, std::string_view line,
+                          const ClientGone& client_gone) {
     nlohmann::json response = {{"id", nullptr}};
     try {
         const nlohmann::json request = nlohmann::json::parse(line);
@@ -110,7 +124,7 @@ std::string HandleRequest(const Handlers& handlers, std::string_view line) {
         if (!params.is_object()) {
             throw std::runtime_error{"params is not an object"};
         }
-        response["result"] = it->second(params);
+        response["result"] = it->second(params, client_gone);
     } catch (const std::exception& error) {
         response = {{"id", response["id"]}, {"error", error.what()}};
     }

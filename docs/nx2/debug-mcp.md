@@ -71,7 +71,8 @@ server copies its threading model, not its protocol.
 Three kinds of work, three places:
 
 1. **Server thread.** Parses requests and runs handlers. Handlers that only read thread-safe
-   state run here directly: status, log tail, log filter. Handlers run one at a time, so a slow
+   state run here directly: status, log tail, log filter, and the guest memory reads
+   (`read_memory`, `search_memory`; see "Guest and GPU memory" for why that is safe). Handlers run one at a time, so a slow
    request (a capture can take seconds) delays the next one. One agent at a time is the expected
    use.
 2. **Rasterizer thread.** Everything that touches the texture cache, pipeline cache, scheduler or
@@ -80,7 +81,7 @@ Three kinds of work, three places:
    `RendererVulkan::Composite` and therefore `rasterizer.TickFrame()`
    (`src/video_core/renderer_vulkan/renderer_vulkan.cpp:269`). Requests for it go through
    `src/video_core/nx2_debug_control.h`, a small mutex-guarded block with one atomic "something
-   is pending" flag. `RasterizerVulkan::TickFrame` (`src/video_core/renderer_vulkan/vk_rasterizer.cpp:1817`)
+   is pending" flag. `RasterizerVulkan::TickFrame` (`src/video_core/renderer_vulkan/vk_rasterizer.cpp:1905`)
    checks the flag and takes the requests at the end of each presented frame. Between frames no
    draw is half-recorded and no pipeline is in use by the caller, so dropping cache entries there
    is safe.
@@ -113,8 +114,9 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
   `capture-<session>-<n>/`, `screenshot-<session>-<n>.png`.
 - **Nothing the server returns comes from game files, keys or firmware.** It returns rendered
   pixels, log lines, frame-dump manifests and shader hashes, which the owner already sends today.
-  Later phases that read memory are limited to guest RAM and GPU memory. They never read host
-  memory, the key area or the file system. The adapter's `capture_image` reads only PNGs inside
+  The memory tools read only the application's guest virtual memory and GPU virtual memory,
+  through their page tables, and never write either. They cannot reach host memory, the key area
+  or the file system: an address resolves only through a page the guest has mapped. The adapter's `capture_image` reads only PNGs inside
   capture directories that it created in this session, and checks for path escapes.
 - **Logs.** `log_tail` returns lines that already go to `eden_log.txt`.
 - **No authentication.** Any local process may connect, the same as with the GDB stub. That is
@@ -130,13 +132,13 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 | `status` | Ask the owner what is on screen, read the log header | One call: title, program id, build, paused, presents, fps, renderer, rejected hashes | 1 |
 | `screenshot` | Owner takes and sends a screenshot | PNG of the next presented frame, as MCP image content | 1 |
 | `log_tail`, `log_filter` | Relaunch with a new filter, owner sends the log | Read new lines since the last call, change the filter live | 1 |
-| `capture_frame` | Relaunch with `EDEN_NX2_FRAME_DUMP`, owner touches `capture.now`, agent copies the dump | Capture the next frame now, sampled inputs optional, get the manifest summary back; `capture_image` returns any pass PNG | 1 |
+| `capture_frame` | Relaunch with `EDEN_NX2_FRAME_DUMP`, owner touches `capture.now`, agent copies the dump | Capture the next frame now, sampled textures and bound buffers optional, get the manifest summary back; `capture_image` returns any pass PNG | 1 |
 | `reject_shaders` | Rebuild the env, relaunch, replay to the spot, once per bisection step | Reject or restore hashes live; bisection becomes a loop of reject, screenshot | 1 |
 | `pause`, `resume`, `step_frames` | Not possible | Freeze on the broken frame, capture it, step one present | 2 |
-| `input` (buttons, sticks, timed sequences) | Owner plays to the spot | Agent walks to the spot itself and replays a repro | 2 |
+| `input`, `input_sequence` (buttons, sticks, frame-timed sequences) | Owner plays to the spot | Agent walks to the spot itself and replays a repro (done) | 2 |
 | `shaders` (inventory) | Shader dump and offline sweep | List loaded programs: key, hash, stage, address, lowered or rejected with the error | 2 |
 | `switches` (live `EDEN_NX2_*`) | Relaunch per switch | Toggle the observer switches live (classification below) | 2 |
-| `read_guest_memory`, `read_gpu_memory` | GDB stub session or log prints plus a rebuild | Read a range by address | 3 |
+| `read_memory`, `search_memory`, `read_gpu_memory` | GDB stub session or log prints plus a rebuild | Read a range by address, find known values in the heap (done) | 3 |
 | `dump_texture`, `dump_buffer` | Frame dump of the whole frame | One resource by GPU address, as PNG plus raw | 3 |
 | `gpu_timings` | `EDEN_NX2_GPU_PROFILE` relaunch, zones only | Per-pass GPU time of one frame | 3 |
 | Capture options (pass range, shader filter) | Not possible | Smaller captures, for example only passes 40 to 60 | 3 |
@@ -166,17 +168,23 @@ default. The service turns it on at boot. A call without `after` returns the new
 it with `SetGlobalFilter` (`logging.cpp:449`), the call the Qt settings dialog makes. Lines
 already filtered out were never formatted, so the new filter applies only to later lines.
 
-**`capture_frame`** `{sampled?, timeout_s?, manifest_lines?, index?}`. It reuses `FrameDump`.
-`FrameDump::Arm` (`vk_frame_dump.cpp:222`) points the next capture at a fresh directory and resets
+**`capture_frame`** `{sampled?, buffers?, timeout_s?, manifest_lines?, index?}`. It reuses
+`FrameDump`. `FrameDump::Arm` (`vk_frame_dump.cpp:268`) points the next capture at a fresh directory and resets
 the per-capture counters, so `EDEN_NX2_FRAME_DUMP` is not needed. When to capture is decided by
 `FrameDumpSchedule`, which has no Vulkan state and is unit-tested. It handles both the env
 triggers and the debug server's requests. It also sets `RecordingSampledTextures`, which the
 graphics and compute pipelines check before they keep the textures each draw and dispatch
 samples. The pipelines used to read `EDEN_NX2_FRAME_DUMP_SAMPLED` once at startup, so a sampled
 request at runtime found no sampled textures to read back. Now the pipelines keep them only during
-a sampled capture, under either trigger. `FrameDump::TickFrame` (`vk_frame_dump.cpp:693`) starts
-the capture exactly as `capture.now` would. The writer thread reports completion after it writes
-the manifest summary (`WriterLoop`, `vk_frame_dump.cpp:568`). The tool returns the directory, the
+a sampled capture, under either trigger. With `buffers: true` the capture also records the uniform
+and storage buffers the buffer cache bound for every draw and dispatch (`kind: buffer`, with stage,
+binding, GPU address and size; bytes deduplicated in `buffer_<hash>.bin.zst`, copied on the GPU
+when the GPU wrote the range) and each dispatch's group counts (`kind: launch`). This is the
+buffer part of fix/oot-fog's frame dump (1ad14bebb8). `EDEN_NX2_FRAME_DUMP_SAMPLED` turns on both
+textures and buffers. At runtime they are separate, so diffing a constant buffer such as a fog
+`c5` across two captures does not pay for every texture readback. `FrameDump::TickFrame`
+(`vk_frame_dump.cpp:849`) starts the capture exactly as `capture.now` would. The writer thread
+reports completion after it writes the manifest summary (`WriterLoop`, `vk_frame_dump.cpp:710`). The tool returns the directory, the
 frame and summary lines, counts per entry kind, the first entries, and the `frame_dump_index.py`
 command. With `index: true`, the adapter runs that command itself. The adapter-only
 `capture_image {directory, name}` returns one pass PNG as image content.
@@ -209,6 +217,105 @@ The tool waits until the rasterizer applies the change and reports `applied`. A 
 loop: reject half of the candidates, screenshot, compare. Today each step is a rebuild of the
 environment plus a relaunch plus a replay.
 
+### Guest and GPU memory (implemented)
+
+All three are read only. Reads return at most 64 KiB. Addresses are hex strings (`"0x8012345000"`)
+or JSON numbers, and results give them back as hex strings.
+
+**`read_memory`** `{address, size, as?}` reads the application process's guest virtual memory.
+`as` is `hex` (default, one string), `u32`, `u64` (hex strings, since JSON numbers lose bits
+past 2^53) or `f32` (`"nan"`, `"inf"` and `"-inf"` for non-finite values). If any page of the
+range is unmapped, the call fails and names the first unmapped address.
+
+**`search_memory`** `{pattern, start?, end?, max_hits?, regions?, budget_ms?}` finds a byte
+pattern (hex pairs in memory order, so little endian: `1.0f` is `0000803f`; up to 256 bytes) in
+mapped guest memory. `regions` is `heap` (default, the heap region from the process page table)
+or `all` (the whole address space); `start` and `end` narrow it. Matches may cross page
+boundaries but not unmapped gaps. It returns at most `max_hits` (default 64, at most 256)
+addresses. It stops after `budget_ms` (default 2000, at most 10000) and then returns
+`complete: false` and `next`. Pass `next` as `start` to continue without missing or repeating a
+match. The intended use is to find a known float tuple, such as the fog layer constants a
+capture shows in `c5`, and from there the time-of-day or dynamic-resolution state. A heap scan
+copies every mapped page once, so it keeps one host core busy for up to the budget: run it once,
+not in a loop, while the owner plays.
+
+**`read_gpu_memory`** `{gpu_address, size, as?, timeout_s?}` reads GPU virtual memory, for
+example query report and semaphore buffers that the game reads back. It runs on the rasterizer
+thread at the next frame end, like a capture, so it fails with "no frame was presented" while
+the game is paused or loading. It tries the bound channel's address space first, then every
+other address space the rasterizer knows, and reads from the first one that maps the whole range
+(`address_space` in the result is `Tegra::MemoryManager::GetID`). Otherwise it names the first
+unmapped address in the bound channel's address space.
+
+How the reads are safe:
+
+- **Guest memory, on the server thread.** `ReadGuestMemory` (`nx2_debug_tools.cpp`) resolves
+  each page with `Memory::GetPointerSilent` (`src/core/memory.cpp:1073`). That is the lock-free
+  lookup the guest CPU cores use: one relaxed atomic load of the page entry. Through
+  `SparseLargeVector::GetOrDefault` (`src/common/sparse_large_vector.h:91`), an entry that was
+  never committed reads as unmapped, so the lookup never commits the sparse table. It never logs,
+  and it never calls `HandleRasterizerDownload`. `ReadBlock` would do all three, and its GPU
+  flush may only run on the rasterizer thread. A mapped entry always points into the
+  `DeviceMemory` backing, which stays mapped and readable for the whole boot (`SEC_COMMIT` on
+  Windows, `src/common/host_memory.cpp:153`; a shared memfd mapping elsewhere). If the game
+  unmaps a page during the copy, the read returns stale bytes instead of faulting.
+  `GetPointerSilent` masks the top 16 bits, so addresses at or above 2^48 count as unmapped
+  instead of aliasing low memory. The service stops before the process is destroyed, so the
+  page table outlives every read.
+- **What a guest read can show.** Guest threads keep running, so a value can change, or tear,
+  while it is copied. Read it twice when that matters. On pages the GPU caches track
+  (`RasterizerCachedMemory`), the read returns the CPU copy: GPU writes that are not written back
+  yet are missing. `capture_frame` with `buffers` shows the GPU side.
+- **GPU memory, on the rasterizer thread.** Each `Tegra::MemoryManager` belongs to an nvdrv
+  address space that the GPU thread uses for every draw. The server thread cannot know whether an
+  address space is still alive, so it does not touch them. The request goes through
+  `nx2_debug_control.h` like a capture. `TickFrame` collects the bound `gpu_memory` and the
+  `address_spaces` under `config_mutex`, then calls `IsFullyMappedRange` and `ReadBlockUnsafe`
+  (`src/video_core/memory_manager.cpp:742`, `:474`), the reads the GPU itself makes. It does not
+  flush the GPU caches, so the result is what guest memory holds, not data that is still only in
+  GPU buffers.
+
+### Input (implemented)
+
+**`input`** `{buttons?, left_stick?, right_stick?, frames, timeout_s?}` holds the buttons and
+sticks for `frames` presented frames and then releases them. It returns when they are done.
+**`input_sequence`** `{steps: [{buttons?, left_stick?, right_stick?, frames}, ...], timeout_s?}`
+runs the steps back to back, at most 1000 steps and 36000 frames per call. A step with no
+buttons and no sticks injects nothing, so it works as a pause between moves.
+
+- **Buttons** are `A B X Y L R ZL ZR Plus Minus Up Down Left Right StickL StickR` (the
+  `NpadButton` names). Home and Capture are not offered: they would leave the game. Unknown
+  names and unknown step keys are refused, so a typo fails instead of doing nothing.
+- **Sticks** are `[x, y]` in -1..1, up is +y, scaled by `HID_JOYSTICK_MAX`.
+
+Where it hooks in: `EmulatedController::SetInputInjector` installs a function that
+`GetNpadButtons` and `GetSticks` call while it is set
+(`src/hid_core/frontend/emulated_controller.cpp`). The npad service reads those two getters on
+every update (`src/hid_core/resources/npad/npad.cpp:449`). Injected buttons are ORed into the
+owner's, and an injected stick replaces the owner's stick and its `StickL*` or `StickR*`
+direction bits (threshold half of full scale, like a real stick). It changes no mapping, profile
+or setting, so it works with whatever the owner has mapped and leaves nothing behind. The input
+goes to player 1, or to the handheld controller when player 1 is not connected; the result names
+which. When no injector is installed, each getter costs one atomic load.
+
+Timing is by presents, not wall time. `RunInput` starts the script at `g_nx2_present_count + 1`,
+the next present. The injector looks up the active step from the present count at every read
+(`InputAt`), so a step changes at the first npad update after its present: the npad updates
+every 1 ms (`src/hid_core/resource_manager.cpp:48`). A slow frame stretches the step in time but
+not in frames, so the same sequence moves the camera the same way on every run.
+
+Release: the injector returns nothing from the end of the last step on, so the input ends on its
+exact frame even before the handler removes it. The handler removes it on every exit path
+(`SCOPE_EXIT`): when the steps are done; on timeout, when frames stop for `timeout_s` (default
+`frames / 20 + 10`, at most 900); when the game shuts down; and when the client disconnects. The
+transport gives every handler a `ClientGone` probe, a non-blocking peek at the request's socket
+(`nx2_debug_server.cpp`), which the wait polls every 2 ms. The adapter waits as long as the
+emulator's default timeout, so it does not drop a long sequence early.
+
+Use it when the owner has put the controller down: injected buttons add to whatever the owner
+presses. For an A/B test, run the same `input_sequence` from the same spot under each variant
+(for example with a `reject_shaders` change in between), then compare screenshots or captures.
+
 ### Phase 2: control and input (about 4 to 5 days)
 
 - **pause, resume, step_frames.** The core has `System::Pause` and `Run` (`src/core/core.cpp:279`).
@@ -218,15 +325,7 @@ environment plus a relaunch plus a replay.
   pause button uses. `step_frames {n}` resumes, waits until `g_nx2_present_count` advances by
   `n`, then pauses. That is present-granular, not exact, because the GPU drains a frame or two
   behind the CPU. Use a capture to get an exact frame.
-- **input.** Inject at `hid_core`'s `EmulatedController`
-  (`src/hid_core/frontend/emulated_controller.h:505`, private `SetButton` and `SetStick`)
-  with a debug overlay: injected buttons are ORed in, and an injected stick replaces the real one
-  while it is held. This works whatever the owner's mapping is. The `VirtualGamepad` engine
-  (`src/input_common/drivers/virtual_gamepad.h:51`) only reaches the game when the player's
-  profile maps to it, and `EDEN_NX2_KEY_SCRIPT` (`src/yuzu_cmd/yuzu.cpp:599`) presses
-  keyboard keys in `eden-cli` only. The tool takes `{buttons, stick_l, stick_r, hold_ms}` and a
-  sequence form `[{at_ms, ...}]`, timed by presents, not wall time, so a slow frame does not
-  shift the input.
+- **input** and **input_sequence** are done; see "Input".
 - **shaders.** An inventory from `ShaderCache::lookup_cache` (key, hash, size, address) and
   `rejected_native` (address plus the exception message), copied on the rasterizer thread like
   the reject change. Each entry carries its stage and whether it was lowered, rejected by the
@@ -247,13 +346,7 @@ Live switch classification, from the switches in `src/`:
 
 ### Phase 3: memory, resources and timing (about 1 to 1.5 weeks)
 
-- **read_guest_memory** `{address, size ≤ 1 MiB}`. Use the application process memory
-  (`KProcess::GetMemory().ReadBlock`), as the GDB stub's `m` packet does
-  (`src/core/debugger/gdbstub.cpp:237`), with unmapped ranges reported instead of read. It can
-  run on the server thread: a racy read of guest RAM is what a debugger does.
-- **read_gpu_memory** `{address, size}`. Use `Tegra::MemoryManager::ReadBlockUnsafe` on the
-  rasterizer thread. The safe read flushes GPU-written pages through the caches, which only that
-  thread may do.
+- **read_memory**, **search_memory** and **read_gpu_memory** are done; see "Guest and GPU memory".
 - **dump_texture** `{gpu_address}` and **dump_buffer** `{gpu_address, size}`. Look the address
   up in the texture cache on the rasterizer thread and reuse `FrameDump::Record`'s readback,
   decode and PNG path for one image.
@@ -291,6 +384,8 @@ once (`EDEN_NX2_KEY_RECORD` already records keys in `eden-cli`) and replayed aft
        --call '{"method":"screenshot","params":{"height":1080}}' --out C:/lx/shot.png
    $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
        --call '{"method":"reject_shaders","params":{"hashes":["3ddfb1d7621c4755"]}}'
+   $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
+       --call '{"method":"input_sequence","params":{"steps":[{"right_stick":[1,0],"frames":60},{"frames":30}]}}'
    ```
 
    The request is `{"method": <tool>, "params": {...}}`, the same format the socket uses. Adapter-only
@@ -306,7 +401,7 @@ the server again on the same port.
 
 ## Phase 1 limits
 
-- Vulkan only for `capture_frame` and `reject_shaders`. The drain point is in
+- Vulkan only for `capture_frame`, `reject_shaders` and `read_gpu_memory`. The drain point is in
   `RasterizerVulkan`. OpenGL would need the same three lines in `RasterizerOpenGL::TickFrame`,
   plus a frame dump it does not have.
 - A runtime capture uses up an `EDEN_NX2_FRAME_DUMP_AT` capture that has not fired yet. They share

@@ -281,8 +281,8 @@ void FrameDump::StopWriter() {
     stop_writer = false;
 }
 
-void FrameDump::Arm(std::filesystem::path directory_, bool sampled, u64 id) {
-    if (!schedule.Arm(sampled, id)) {
+void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id) {
+    if (!schedule.Arm(sampled, buffers, id)) {
         VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
         return;
     }
@@ -295,6 +295,8 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, u64 id) {
     images = 0;
     pass_framebuffer = nullptr;
     dispatch_sampled.clear();
+    seen_buffers.clear();
+    written_buffers.clear();
     pass_index = 0;
     draws = 0;
     dispatches = 0;
@@ -994,13 +996,14 @@ void FrameDump::TickFrame() {
         });
     }
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
-             elapsed, schedule.Sampled() ? " with sampled textures" : "", directory.string());
+             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), directory.string());
 }
 
 void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,
                                   bool sampled_) {
     enabled = true;
     sampled = sampled_;
+    buffers = sampled_;
     if (at == "file") {
         trigger_file = std::move(trigger_file_);
     } else if (at.ends_with('f')) {
@@ -1010,13 +1013,14 @@ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path tri
     }
 }
 
-bool FrameDumpSchedule::Arm(bool sampled_, u64 id) {
+bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id) {
     if (capturing) {
         return false;
     }
     enabled = true;
     done = false;
     sampled = sampled_;
+    buffers = buffers_;
     trigger_frame = 0;
     capture_id = id;
     return true;

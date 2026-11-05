@@ -171,6 +171,8 @@ private:
      */
     void ClearInput();
 
+    void ApplyCommand(size_t player_index, const TASCommand& command);
+
     /**
      * Converts an u64 containing the button status into the text equivalent
      * @param buttons Bitfield with the status of the buttons

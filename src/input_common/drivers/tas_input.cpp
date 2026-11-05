@@ -58,6 +58,12 @@ Tas::Tas(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
             .pad = 0,
         };
         PreSetController(identifier);
+        for (int button = 0; button < 64; ++button) {
+            PreSetButton(identifier, button);
+        }
+        for (int axis = 0; axis < static_cast<int>(TasAxis::Undefined); ++axis) {
+            PreSetAxis(identifier, axis);
+        }
     }
     ClearInput();
     if (!Settings::values.tas_enable) {
@@ -211,20 +217,7 @@ void Tas::UpdateThread() {
                 command = commands[player_index][frame];
             }
 
-            PadIdentifier identifier{
-                .guid = Common::UUID{},
-                .port = player_index,
-                .pad = 0,
-            };
-            for (std::size_t i = 0; i < sizeof(command.buttons) * 8; ++i) {
-                const bool button_status = (command.buttons & (1LLU << i)) != 0;
-                const int button = static_cast<int>(i);
-                SetButton(identifier, button, button_status);
-            }
-            SetTasAxis(identifier, TasAxis::StickX, command.l_axis.x);
-            SetTasAxis(identifier, TasAxis::StickY, command.l_axis.y);
-            SetTasAxis(identifier, TasAxis::SubstickX, command.r_axis.x);
-            SetTasAxis(identifier, TasAxis::SubstickY, command.r_axis.y);
+            ApplyCommand(player_index, command);
         }
     } else {
         is_running = Settings::values.tas_loop.GetValue();
@@ -235,8 +228,28 @@ void Tas::UpdateThread() {
 }
 
 void Tas::ClearInput() {
-    ResetButtonState();
-    ResetAnalogState();
+    for (size_t player_index = 0; player_index < commands.size(); ++player_index) {
+        ApplyCommand(player_index, {});
+    }
+}
+
+void Tas::ApplyCommand(size_t player_index, const TASCommand& command) {
+    const PadIdentifier identifier{
+        .guid = Common::UUID{},
+        .port = player_index,
+        .pad = 0,
+    };
+    for (std::size_t i = 0; i < sizeof(command.buttons) * 8; ++i) {
+        const bool button_status = (command.buttons & (1LLU << i)) != 0;
+        const int button = static_cast<int>(i);
+        if (GetButton(identifier, button) != button_status) {
+            SetButton(identifier, button, button_status);
+        }
+    }
+    SetTasAxis(identifier, TasAxis::StickX, command.l_axis.x);
+    SetTasAxis(identifier, TasAxis::StickY, command.l_axis.y);
+    SetTasAxis(identifier, TasAxis::SubstickX, command.r_axis.x);
+    SetTasAxis(identifier, TasAxis::SubstickY, command.r_axis.y);
 }
 
 TasAnalog Tas::ReadCommandAxis(const std::string& line) const {
@@ -296,7 +309,9 @@ std::string Tas::WriteCommandAxis(TasAnalog analog) const {
 }
 
 void Tas::SetTasAxis(const PadIdentifier& identifier, TasAxis axis, f32 value) {
-    SetAxis(identifier, static_cast<int>(axis), value);
+    if (GetAxis(identifier, static_cast<int>(axis)) != value) {
+        SetAxis(identifier, static_cast<int>(axis), value);
+    }
 }
 
 void Tas::StartStop() {
