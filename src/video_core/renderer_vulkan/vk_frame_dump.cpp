@@ -915,15 +915,17 @@ void FrameDump::TickFrame() {
         Drain();
         if (!probes.empty()) {
             scheduler.Finish();
-            std::vector<u64> samples(probes.size());
+            // Clipping invocations, clipping primitives and fragment shader invocations.
+            std::vector<std::array<u64, 3>> counts(probes.size());
             const VkResult result = device.GetLogical().GetQueryResults(
-                *probe_pool, 0, static_cast<u32>(probes.size()), samples.size() * sizeof(u64),
-                samples.data(), sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                *probe_pool, 0, static_cast<u32>(probes.size()), counts.size() * sizeof(counts[0]),
+                counts.data(), sizeof(counts[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             for (size_t index = 0; result == VK_SUCCESS && index < probes.size(); ++index) {
                 const Probe& probe = probes[index];
                 Enqueue({.tags = fmt::format(
-                             R"({{"kind":"draw","draw":{},"samples":{},"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{},"host_alpha_to_coverage":{},"color0":{},"kill":{},"zero_handles":{}}})",
-                             probe.draw, samples[index], probe.mesh, probe.indirect, probe.first,
+                             R"({{"kind":"draw","draw":{},"primitives_in":{},"primitives":{},"fragments":{},"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{},"host_alpha_to_coverage":{},"color0":{},"kill":{},"zero_handles":{}}})",
+                             probe.draw, counts[index][0], counts[index][1], counts[index][2],
+                             probe.mesh, probe.indirect, probe.first,
                              probe.elements, probe.instances, probe.alpha_test, probe.alpha_ref,
                              probe.alpha_to_coverage, probe.host_alpha_to_coverage, probe.color0,
                              probe.kill, probe.zero_handles)});
@@ -957,14 +959,19 @@ void FrameDump::TickFrame() {
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
-    if (schedule.Sampled()) {
+    if (schedule.Sampled() && !device.IsPipelineStatisticsQuerySupported()) {
+        LOG_WARNING(Render_Vulkan, "Frame dump: no pipelineStatisticsQuery, draws are not probed");
+    } else if (schedule.Sampled()) {
+        // Pipeline statistics, not occlusion: games keep their own occlusion queries active.
         probe_pool = device.GetLogical().CreateQueryPool({
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .queryType = VK_QUERY_TYPE_OCCLUSION,
+            .queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS,
             .queryCount = MAX_PROBES,
-            .pipelineStatistics = 0,
+            .pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+                                  VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+                                  VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT,
         });
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([pool = *probe_pool](vk::CommandBuffer cmdbuf) {

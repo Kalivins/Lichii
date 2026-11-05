@@ -144,8 +144,8 @@ public:
     /// Returns true when copies were recorded, which ends the current render pass.
     bool BeginPass(const void* framebuffer, std::span<ImageView* const> colors);
     void NoteDraw(std::span<const u64> shader_hashes);
-    /// Starts counting the samples the draw about to be recorded passes; returns the query to end
-    /// after it. Sampled captures only, and not while the game counts samples itself.
+    /// Starts counting the primitives and fragments of the draw about to be recorded; returns the
+    /// query to end after it. Sampled captures only.
     std::optional<u32> BeginProbe();
     struct Probe {
         u32 draw;

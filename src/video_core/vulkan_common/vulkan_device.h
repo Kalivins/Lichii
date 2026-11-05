@@ -676,6 +676,10 @@ FN_MAX_LIMIT_LIST
     }
 
     /// Returns true if the device supports task and mesh shaders (VK_EXT_mesh_shader).
+    bool IsPipelineStatisticsQuerySupported() const {
+        return features.features.pipelineStatisticsQuery;
+    }
+
     bool IsExtMeshShaderSupported() const {
         return extensions.mesh_shader && features.mesh_shader.taskShader &&
                features.mesh_shader.meshShader;
