@@ -220,6 +220,7 @@ private:
     void UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+    bool alpha_to_coverage_enable{}; ///< Last value recorded with SetAlphaToCoverageEnableEXT
     void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateFrontFace(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -231,6 +232,8 @@ private:
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
+    /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
+    bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;

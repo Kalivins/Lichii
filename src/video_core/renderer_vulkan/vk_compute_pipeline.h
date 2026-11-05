@@ -74,6 +74,7 @@ public:
     struct SampledImage {
         u32 tic;
         VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
     };
 
     /// The textures sampled by the last configured dispatch, kept for EDEN_NX2_FRAME_DUMP_SAMPLED.

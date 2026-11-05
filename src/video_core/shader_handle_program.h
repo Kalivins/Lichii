@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/alignment.h"
 #include "common/common_types.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/memory_manager.h"
@@ -11,10 +12,11 @@ namespace VideoCommon {
 
 /// The texture handle a shader reads from a storage buffer, computed from the current constant
 /// buffer and storage buffer words (Shader::Info::handle_programs). cbuf_address(index) is the
-/// bound constant buffer's address, 0 when none is bound.
+/// bound constant buffer's address, 0 when none is bound. Storage words are read from the buffer
+/// address aligned down to storage_alignment.
 template <typename CbufAddress>
 u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Tegra::MemoryManager& gpu_memory,
-                          CbufAddress&& cbuf_address) {
+                          CbufAddress&& cbuf_address, u64 storage_alignment = 1) {
     return Shader::EvaluateHandleProgram(
                info.handle_programs[program],
                [&](u32 index, u32 offset) -> u32 {
@@ -31,7 +33,10 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Tegra::MemoryMa
                        return 0U;
                    }
                    const GPUVAddr base{gpu_memory.Read<u64>(cbuf + descriptor.cbuf_offset)};
-                   return base != 0 ? gpu_memory.Read<u32>(base + offset) : 0U;
+                   return base != 0
+                              ? gpu_memory.Read<u32>(Common::AlignDown(base, storage_alignment) +
+                                                     offset)
+                              : 0U;
                })
         .value_or(0U);
 }

@@ -97,6 +97,7 @@ public:
         u32 stage;
         u32 tic;
         VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
     };
 
     /// The sampled textures of the last configured draw, kept for EDEN_NX2_FRAME_DUMP_SAMPLED.
@@ -110,6 +111,15 @@ public:
 
     bool SupportsAlphaToOne() const noexcept {
         return fragment_has_color0_output;
+    }
+
+    /// Texture handles of the last configured draw whose handle program gave 0.
+    u32 ZeroTextureHandles() const noexcept {
+        return zero_texture_handles;
+    }
+
+    bool FragmentCanDiscard() const noexcept {
+        return stage_infos[NUM_STAGES - 1].uses_demote_to_helper_invocation;
     }
 
     bool UsesExtendedDynamicState() const noexcept {
@@ -211,6 +221,7 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
+    u32 zero_texture_handles{};
     bool writes_storage{};
 
     vk::DescriptorSetLayout descriptor_set_layout;

@@ -90,6 +90,8 @@ def main():
             header = entry
         elif entry.get("kind") == "summary":
             summary = entry
+        elif entry.get("kind") in ("buffer", "launch", "skipped", "draw"):
+            continue
         else:
             entries.append(entry)
     info = (f"frame {header.get('frame', '?')} at {header.get('seconds', '?')} s · "

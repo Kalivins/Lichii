@@ -10,6 +10,8 @@
 
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
+#include "common/div_ceil.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/stb.h"
@@ -177,6 +179,51 @@ std::string JsonArray(std::span<T> values) {
     return out + "]";
 }
 
+std::string_view FilterName(VkFilter filter) {
+    return filter == VK_FILTER_NEAREST ? "nearest" : filter == VK_FILTER_LINEAR ? "linear" : "other";
+}
+
+std::string_view WrapName(VkSamplerAddressMode mode) {
+    switch (mode) {
+    case VK_SAMPLER_ADDRESS_MODE_REPEAT:
+        return "repeat";
+    case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT:
+        return "mirrored_repeat";
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:
+        return "clamp_to_edge";
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:
+        return "clamp_to_border";
+    case VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE:
+        return "mirror_clamp_to_edge";
+    default:
+        return "other";
+    }
+}
+
+/// The host sampler state and the raw guest TSC words it came from.
+std::string SamplerJson(const Sampler* sampler) {
+    if (!sampler) {
+        return {};
+    }
+    const VkSamplerCreateInfo& ci = sampler->CreateInfo();
+    std::array<u32, 8> words;
+    static_assert(sizeof(words) == sizeof(Tegra::Texture::TSCEntry));
+    std::memcpy(words.data(), &sampler->Descriptor(), sizeof(words));
+    std::string tsc;
+    for (const u32 word : words) {
+        tsc += fmt::format("{}\"{:08x}\"", tsc.empty() ? "" : ",", word);
+    }
+    return fmt::format(
+        R"(,"sampler":{{"mag":"{}","min":"{}","mip":"{}","wrap":["{}","{}","{}"],"unnormalized":{},"compare":{},"compare_op":{},"lod_bias":{},"min_lod":{},"max_lod":{},"anisotropy":{},"tsc":[{}]}})",
+        FilterName(ci.magFilter), FilterName(ci.minFilter),
+        ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? "linear" : "nearest",
+        WrapName(ci.addressModeU), WrapName(ci.addressModeV), WrapName(ci.addressModeW),
+        ci.unnormalizedCoordinates != VK_FALSE, ci.compareEnable != VK_FALSE,
+        static_cast<u32>(ci.compareOp), JsonNumber(ci.mipLodBias), JsonNumber(ci.minLod),
+        JsonNumber(ci.maxLod), ci.anisotropyEnable != VK_FALSE ? JsonNumber(ci.maxAnisotropy) : "1",
+        tsc);
+}
+
 } // Anonymous namespace
 
 FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
@@ -229,7 +276,8 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
     if (info.type == VideoCommon::ImageType::Buffer ||
         (type != SurfaceType::ColorTexture && type != SurfaceType::Depth &&
          type != SurfaceType::DepthStencil) ||
-        DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1) {
+        (DefaultBlockWidth(info.format) != 1 &&
+         True(image->flags & VideoCommon::ImageFlagBits::Converted))) {
         return std::nullopt;
     }
     DepthEncoding depth_encoding = DepthEncoding::None;
@@ -273,6 +321,13 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
         .msaa = info.num_samples > 1,
         .depth_encoding = depth_encoding,
     };
+}
+
+size_t FrameDump::TargetBytes(const Target& target) {
+    using namespace VideoCore::Surface;
+    return size_t{Common::DivCeil(target.width, DefaultBlockWidth(target.format))} *
+           Common::DivCeil(target.height, DefaultBlockHeight(target.format)) * target.depth *
+           TexelBytes(target);
 }
 
 u32 FrameDump::TexelBytes(const Target& target) {
@@ -320,6 +375,7 @@ bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> c
     }
     pass_hashes.clear();
     pass_sampled.clear();
+    pass_null_sampled.clear();
     pass_first_draw = draws;
     return recorded;
 }
@@ -338,7 +394,20 @@ std::optional<std::pair<GPUVAddr, u32>> SampledKey(const FrameDump::Sampled& tex
 
 bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string name,
                               std::string tags) {
+    tags += SamplerJson(texture.sampler);
     if (const auto target = MakeTarget(*texture.view, index)) {
+        if (VideoCore::Surface::DefaultBlockWidth(target->format) != 1) {
+            const std::tuple key{target->gpu_addr, static_cast<u32>(target->format), target->level,
+                                 target->layer};
+            if (std::ranges::find(recorded_blocks, key) != recorded_blocks.end()) {
+                Enqueue({.tags = fmt::format(
+                             R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"gpu_addr":"{:#x}","skipped":"recorded"}})",
+                             name, tags, target->format, target->width, target->height,
+                             target->gpu_addr)});
+                return false;
+            }
+            recorded_blocks.push_back(key);
+        }
         return Record(*target, std::move(name), std::move(tags));
     }
     const Image& image = *texture.view->BackingImage();
@@ -354,7 +423,17 @@ bool FrameDump::NoteSampled(std::span<const Sampled> textures) {
     bool recorded = false;
     for (const Sampled& texture : textures) {
         const auto key = SampledKey(texture);
-        if (!key || std::ranges::find(pass_sampled, *key) != pass_sampled.end()) {
+        if (!key) {
+            const std::pair stage_tic{texture.stage, texture.tic};
+            if (std::ranges::find(pass_null_sampled, stage_tic) == pass_null_sampled.end()) {
+                pass_null_sampled.push_back(stage_tic);
+                Enqueue({.tags = fmt::format(
+                             R"({{"kind":"sampled","pass":{},"draw":{},"stage":{},"tic":{},"null":true}})",
+                             pass_index, draws - 1, texture.stage, texture.tic)});
+            }
+            continue;
+        }
+        if (std::ranges::find(pass_sampled, *key) != pass_sampled.end()) {
             continue;
         }
         const u32 index = static_cast<u32>(pass_sampled.size());
@@ -389,6 +468,81 @@ void FrameDump::NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> te
                 R"("kind":"sampled","dispatch":{},"after_draws":{},"stage":{},"tic":{},"index":{},"shaders":["{:016x}"])",
                 dispatches, draws, texture.stage, texture.tic, index, shader_hash));
     }
+}
+
+bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
+                            std::span<BoundBuffer> buffers) {
+    bool recorded = false;
+    for (BoundBuffer& buffer : buffers) {
+        const size_t program = compute ? 0 : buffer.stage + 1;
+        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
+                                                       buffer.device_addr, buffer.size};
+        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
+            continue;
+        }
+        seen_buffers.push_back(key);
+        const std::string owner =
+            compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
+                    : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
+        const bool from_host = buffer.guest.empty();
+        std::string tags = fmt::format(
+            R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
+            owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
+            buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
+            buffer.gpu_modified, from_host ? "host" : "guest");
+        if (!from_host) {
+            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
+            continue;
+        }
+        recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
+    }
+    return recorded;
+}
+
+void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
+                           const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
+                           std::optional<std::array<u32, 3>> indirect_grid) {
+    std::string tags = fmt::format(
+        R"({{"kind":"launch","dispatch":{},"after_draws":{},"shaders":["{:016x}"],"grid":[{},{},{}],"block":[{},{},{}])",
+        dispatches, draws, shader_hash, grid[0], grid[1], grid[2], block[0], block[1], block[2]);
+    if (indirect) {
+        tags += fmt::format(R"(,"indirect":"{:#x}")", *indirect);
+    }
+    if (indirect_grid) {
+        tags += fmt::format(R"(,"indirect_grid_guest":[{},{},{}])", (*indirect_grid)[0],
+                            (*indirect_grid)[1], (*indirect_grid)[2]);
+    }
+    Enqueue({.tags = tags + "}"});
+}
+
+std::optional<u32> FrameDump::BeginProbe() {
+    if (!probe_pool || probes.size() >= MAX_PROBES) {
+        return std::nullopt;
+    }
+    const u32 query = static_cast<u32>(probes.size());
+    probes.push_back({.draw = draws - 1});
+    scheduler.Record([pool = *probe_pool, query](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BeginQuery(pool, query, 0);
+    });
+    return query;
+}
+
+void FrameDump::EndProbe(u32 query, Probe probe) {
+    scheduler.Record([pool = *probe_pool, query](vk::CommandBuffer cmdbuf) {
+        cmdbuf.EndQuery(pool, query);
+    });
+    probe.draw = probes[query].draw;
+    probes[query] = probe;
+}
+
+void FrameDump::NoteSkipped(bool compute, u64 program, GPUVAddr rt0, std::string_view reason) {
+    std::string text{reason};
+    std::ranges::replace(text, '"', '\'');
+    std::ranges::replace(text, '\\', '/');
+    Enqueue({.tags = fmt::format(
+                 R"({{"kind":"skipped","compute":{},"after_draws":{},"after_dispatches":{},"program":"{:#x}","rt0":"{:#x}","reason":"{}"}})",
+                 compute, draws, dispatches, program, rt0, text)});
 }
 
 void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
@@ -455,7 +609,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         Enqueue({.tags = fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags)});
         return false;
     }
-    const size_t size = size_t{target.width} * target.height * target.depth * TexelBytes(target);
+    const size_t size = TargetBytes(target);
     if (recorded_bytes + size > SIZE_CAP) {
         truncated = true;
         return false;
@@ -509,6 +663,51 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
     return true;
 }
 
+bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
+    if (recorded_bytes + size > SIZE_CAP) {
+        truncated = true;
+        return false;
+    }
+    recorded_bytes += size;
+    vk::Buffer buffer = memory_allocator.CreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        },
+        MemoryUsage::Download);
+    const VkBufferCopy copy{.srcOffset = offset, .dstOffset = 0, .size = size};
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([source, destination = *buffer, copy](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier before{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, before);
+        cmdbuf.CopyBuffer(source, destination, copy);
+        const VkMemoryBarrier after{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                             VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               after);
+    });
+    pending_bytes += size;
+    readbacks.push_back({.buffer = std::move(buffer),
+                         .target = {},
+                         .name = {},
+                         .tags = std::move(tags),
+                         .raw = true,
+                         .bytes = size});
+    return true;
+}
+
 void FrameDump::DrainIfFull() {
     if (pending_bytes >= STAGING_BUDGET) {
         Drain();
@@ -523,12 +722,13 @@ void FrameDump::Drain() {
     for (Readback& readback : readbacks) {
         readback.buffer.Invalidate();
         const Target& target = readback.target;
-        const auto mapped = readback.buffer.Mapped().first(size_t{target.width} * target.height *
-                                                           target.depth * TexelBytes(target));
+        const auto mapped = readback.buffer.Mapped().first(
+            readback.raw ? readback.bytes : TargetBytes(target));
         Enqueue({.target = target,
                  .name = std::move(readback.name),
                  .tags = std::move(readback.tags),
-                 .data = {mapped.begin(), mapped.end()}});
+                 .data = {mapped.begin(), mapped.end()},
+                 .raw = readback.raw});
     }
     readbacks.clear();
     pending_bytes = 0;
@@ -566,7 +766,9 @@ void FrameDump::WriterLoop() {
                                    : "");
             continue;
         }
-        if (job.name.empty()) {
+        if (job.raw) {
+            WriteBuffer(job);
+        } else if (job.name.empty()) {
             manifest << job.tags << '\n';
         } else {
             Write(job);
@@ -658,6 +860,18 @@ void FrameDump::Write(const Job& job) {
              << '\n';
 }
 
+void FrameDump::WriteBuffer(const Job& job) {
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(job.data.data()),
+                                        job.data.size());
+    const std::string name = fmt::format("buffer_{:016x}.bin.zst", hash);
+    if (std::ranges::find(written_buffers, hash) == written_buffers.end()) {
+        written_buffers.push_back(hash);
+        WriteFile(name, Common::Compression::CompressDataZSTDDefault(job.data.data(),
+                                                                     job.data.size()));
+    }
+    manifest << fmt::format(R"({{{},"hash":"{:016x}","raw":"{}"}})", job.tags, hash, name) << '\n';
+}
+
 void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
     std::ofstream file{directory / name, std::ios::binary};
     file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
@@ -672,6 +886,26 @@ void FrameDump::TickFrame() {
     if (capturing) {
         EndPass();
         Drain();
+        if (!probes.empty()) {
+            scheduler.Finish();
+            std::vector<u64> samples(probes.size());
+            const VkResult result = device.GetLogical().GetQueryResults(
+                *probe_pool, 0, static_cast<u32>(probes.size()), samples.size() * sizeof(u64),
+                samples.data(), sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            for (size_t index = 0; result == VK_SUCCESS && index < probes.size(); ++index) {
+                const Probe& probe = probes[index];
+                Enqueue({.tags = fmt::format(
+                             R"({{"kind":"draw","draw":{},"samples":{},"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{},"host_alpha_to_coverage":{},"color0":{},"kill":{},"zero_handles":{}}})",
+                             probe.draw, samples[index], probe.mesh, probe.indirect, probe.first,
+                             probe.elements, probe.instances, probe.alpha_test, probe.alpha_ref,
+                             probe.alpha_to_coverage, probe.host_alpha_to_coverage, probe.color0,
+                             probe.kill, probe.zero_handles)});
+            }
+            if (result != VK_SUCCESS) {
+                LOG_ERROR(Render_Vulkan, "Frame dump: reading the draw probes failed ({})",
+                          static_cast<int>(result));
+            }
+        }
         Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index,
                                      draws, dispatches),
                  .summary = true,
@@ -698,6 +932,20 @@ void FrameDump::TickFrame() {
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
+    if (sampled) {
+        probe_pool = device.GetLogical().CreateQueryPool({
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .queryType = VK_QUERY_TYPE_OCCLUSION,
+            .queryCount = MAX_PROBES,
+            .pipelineStatistics = 0,
+        });
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([pool = *probe_pool](vk::CommandBuffer cmdbuf) {
+            cmdbuf.ResetQueryPool(pool, 0, MAX_PROBES);
+        });
+    }
     capturing = true;
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot) into {}", frame,
              elapsed, directory.string());

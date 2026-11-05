@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -46,6 +47,9 @@ namespace {
 using boost::container::small_vector;
 using boost::container::static_vector;
 using Shader::ImageBufferDescriptor;
+using Shader::Backend::SPIRV::MESH_DRAW_BASE_OFFSET;
+using Shader::Backend::SPIRV::MeshDrawBaseLayout;
+using Shader::Backend::SPIRV::MeshFirstEnabled;
 using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
@@ -395,6 +399,7 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+    zero_texture_handles = 0;
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -426,14 +431,34 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                       info, desc.handle_program, *gpu_memory,
-                                       [&](u32 cbuf) -> GPUVAddr {
-                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
-                                                      ? cbufs[cbuf].address
-                                                      : GPUVAddr{};
-                                       }),
-                                   via_header_index);
+                const auto evaluate{[&](u64 storage_alignment) {
+                    return VideoCommon::EvaluateTextureHandle(
+                        info, desc.handle_program, *gpu_memory,
+                        [&](u32 cbuf) -> GPUVAddr {
+                            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                              : GPUVAddr{};
+                        },
+                        storage_alignment);
+                }};
+                // The program's storage offsets are relative to the buffer address aligned down
+                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=1 reads
+                // the words there instead of at the unaligned address.
+                static const bool align_storage{std::getenv("EDEN_NX2_HANDLE_ALIGN") != nullptr};
+                const u64 storage_alignment{device.GetStorageBufferAlignment()};
+                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
+                if (raw == 0) {
+                    ++zero_texture_handles;
+                    static std::set<std::pair<u64, u32>> logged;
+                    const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};
+                    if (logged.size() < 64 && logged.insert(key_program).second) {
+                        LOG_INFO(Render_Vulkan,
+                                 "Texture handle program {} of stage {} (shader {:016x}) gave 0; "
+                                 "aligned to {} it gives {:#x}, unaligned {:#x}",
+                                 desc.handle_program, stage, key_program.first, storage_alignment,
+                                 evaluate(storage_alignment), evaluate(1));
+                    }
+                }
+                return TexturePair(raw, via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
@@ -524,6 +549,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (record_sampled) {
         sampled_images.clear();
         size_t view_index{};
+        size_t sampler_index{};
         for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
             if (!Spec::enabled_stages[stage]) {
                 continue;
@@ -536,9 +562,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
             }
             const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
-            for (u32 texture = 0; texture < textures; ++texture, ++view_index) {
-                sampled_images.push_back(
-                    {static_cast<u32>(stage), views[view_index].index, views[view_index].id});
+            for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
+                sampled_images.push_back({static_cast<u32>(stage), views[view_index].index,
+                                          views[view_index].id, samplers[sampler_index]});
             }
             if constexpr (Spec::has_images) {
                 view_index += Shader::NumDescriptors(info.image_descriptors);
@@ -752,6 +778,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
+    const bool push_mesh_draw_base{IsMeshPipeline() && MeshFirstEnabled()};
+    MeshDrawBaseLayout mesh_draw_base{};
+    if (push_mesh_draw_base) {
+        const u32 first{maxwell3d->draw_manager.draw_state.vertex_buffer.first};
+        (stage_infos[0].is_task ? mesh_draw_base.task : mesh_draw_base.mesh) = first;
+    }
     const bool bind_descriptor_buffer{
         descriptor_set_layout && uses_descriptor_buffer &&
         scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
@@ -778,7 +810,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words, push_mesh_draw_base,
+                      mesh_draw_base](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -806,6 +839,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (uses_render_area) {
             cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                  sizeof(render_area_data), &render_area_data);
+        }
+        if (push_mesh_draw_base) {
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, MESH_DRAW_BASE_OFFSET,
+                                 sizeof(mesh_draw_base), &mesh_draw_base);
         }
         if (!descriptor_set_layout) {
             return;

@@ -4493,6 +4493,7 @@ void CustomBorderColorBudget::Release() noexcept {
 Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc) {
     const auto& device = runtime.device;
     device_ptr = &device;
+    descriptor = tsc;
     border_color = tsc.BorderColor();
     srgb_border_color = tsc.SrgbBorderColor();
 
