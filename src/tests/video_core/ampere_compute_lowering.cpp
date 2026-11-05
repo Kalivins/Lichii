@@ -145,7 +145,7 @@ TEST_CASE("Ampere DEPBAR.LE preserves shared visibility for SB0 wait lists", "[v
         REQUIRE(std::count(copying.instructions.begin(), copying.instructions.end(),
                            0xef98000000070000ULL) == (shared_wait ? 1 : 0));
         REQUIRE(copying.source_instruction_offsets[2] - copying.source_instruction_offsets[1] ==
-                (shared_wait ? 1 : 0));
+                (shared_wait ? 1U : 0U));
         if (shared_wait) {
             REQUIRE(copying.instructions[copying.source_instruction_offsets[1]] ==
                     0xef98000000070000ULL);

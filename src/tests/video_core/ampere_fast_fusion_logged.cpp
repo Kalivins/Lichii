@@ -899,8 +899,8 @@ TEST_CASE("Fast Fusion logged async copy uses its source predicate and full 64-b
                     machine.shared[128 + i * 4] = 0xdeadbeef;
                 }
                 machine.Run(lowered.instructions);
-                CHECK(machine.reads == (active && source ? 4 : 0));
-                CHECK(machine.writes == (active ? 4 : 0));
+                CHECK(machine.reads == (active && source ? 4U : 0U));
+                CHECK(machine.writes == (active ? 4U : 0U));
                 for (u32 i = 0; i < 4; ++i)
                     CHECK(machine.shared.at(128 + i * 4) == (!active  ? 0xdeadbeefU
                                                              : source ? 0xfeedfaceU + i

@@ -300,7 +300,7 @@ TEST_CASE("Star Fox ULDC U16 preserves halfword offsets uniform destinations and
                     const bool taken = guard == 7 || enabled != (guard == 8);
                     const u32 target = dest < 22 ? dest + 216 : dest + 218;
                     const u32 expected = offset & 2 ? 0x8001U : 0xfedcU;
-                    CHECK(translated.constant_reads == (taken ? 1 : 0));
+                    CHECK(translated.constant_reads == (taken ? 1U : 0U));
                     CHECK(translated.predicates == predicates);
                     for (u32 reg = 0; reg < 246; ++reg)
                         CHECK(translated.registers[reg] ==
