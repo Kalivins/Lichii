@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <memory>
 #include <algorithm>
 #include <array>
 
@@ -619,9 +620,17 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
         u64 serial;
         size_t result;
     };
-    thread_local std::array<Entry, 64> cache{};
+    // 64 slots were too few: in the same forest the misses still walked pages for 20% of the GPU
+    // thread (sampled profile of 2990fc57). Each thread that asks gets 4096 slots, made on first
+    // use so that the other threads keep their static TLS small.
+    static constexpr size_t CacheBits = 12;
+    using Cache = std::array<Entry, size_t{1} << CacheBits>;
+    thread_local std::unique_ptr<Cache> cache;
+    if (!cache) [[unlikely]] {
+        cache = std::make_unique<Cache>();
+    }
     const u64 serial = map_serial.load(std::memory_order_acquire);
-    Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 58];
+    Entry& entry = (*cache)[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> (64 - CacheBits)];
     if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size &&
         entry.serial == serial) {
         return entry.result;
