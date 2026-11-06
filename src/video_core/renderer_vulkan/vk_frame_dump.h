@@ -263,6 +263,8 @@ private:
     size_t pending_bytes{};
     size_t recorded_bytes{};
     size_t written_bytes{};
+    /// This capture keeps rows only: no pixels or buffer bytes (EDEN_NX2_FRAME_DUMP_ROWS_ONLY_FILE).
+    bool rows_only{};
     u32 sequence{};
     u32 images{};
 

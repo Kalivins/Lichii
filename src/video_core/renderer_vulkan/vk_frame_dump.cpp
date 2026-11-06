@@ -291,6 +291,10 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     truncated = false;
     recorded_bytes = 0;
     written_bytes = 0;
+    // EDEN_NX2_FRAME_DUMP_ROWS_ONLY_FILE=<path>: while that file exists, a capture armed now
+    // writes its manifest rows without any image or buffer bytes, so a frame costs seconds.
+    static const char* const rows_only_file = std::getenv("EDEN_NX2_FRAME_DUMP_ROWS_ONLY_FILE");
+    rows_only = rows_only_file != nullptr && std::filesystem::exists(rows_only_file);
     sequence = 0;
     images = 0;
     pass_framebuffer = nullptr;
@@ -526,6 +530,15 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
             compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
                     : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
         const bool from_host = buffer.guest.empty();
+        if (rows_only) {
+            Enqueue({.tags = fmt::format(
+                         R"({{"kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"{}","skipped":"rows-only"}})",
+                         owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform",
+                         buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr,
+                         buffer.bound_size, buffer.size, buffer.gpu_modified,
+                         from_host ? "host" : "guest")});
+            continue;
+        }
         std::string tags = fmt::format(
             R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
             owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
@@ -666,12 +679,12 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         return false;
     }
     const size_t size = TargetBytes(target);
-    if (recorded_bytes + size > SizeCap()) {
-        truncated = true;
+    if (rows_only || recorded_bytes + size > SizeCap()) {
+        truncated |= !rows_only;
         Enqueue({.tags = fmt::format(
-                     R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"gpu_addr":"{:#x}","skipped":"cap"}})",
+                     R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"gpu_addr":"{:#x}","skipped":"{}"}})",
                      name, tags, target.format, target.width, target.height, target.depth,
-                     target.gpu_addr)});
+                     target.gpu_addr, rows_only ? "rows-only" : "cap")});
         return false;
     }
     recorded_bytes += size;
@@ -724,9 +737,9 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
 }
 
 bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
-    if (recorded_bytes + size > SizeCap()) {
-        truncated = true;
-        Enqueue({.tags = "{" + tags + R"(,"skipped":"cap"})"});
+    if (rows_only || recorded_bytes + size > SizeCap()) {
+        truncated |= !rows_only;
+        Enqueue({.tags = "{" + tags + (rows_only ? R"(,"skipped":"rows-only"})" : R"(,"skipped":"cap"})")});
         return false;
     }
     recorded_bytes += size;
