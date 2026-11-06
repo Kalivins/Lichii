@@ -345,7 +345,9 @@ void RegAlloc::HostCall(
         DefineValueImpl(code, result_def, ABI_RETURN);
 
     for (size_t i = 0; i < args.size(); i++) {
-        if (args[i]) {
+        // A Void argument (CallHostFunction with fewer than three arguments) is no argument: it is
+        // not an immediate to load, and its register is only scratched like an absent one.
+        if (args[i] && !args[i]->get().IsVoid()) {
             UseScratch(code, *args[i], args_hostloc[i]);
         } else {
             ScratchGpr(code, args_hostloc[i]); // TODO: Force spill
