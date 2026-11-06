@@ -17,6 +17,7 @@
 #include "common/fs/path_util.h"
 #include "common/scope_exit.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/stb.h"
@@ -73,6 +74,7 @@ struct ToolState {
     std::string log_filter{Settings::values.log_filter.GetValue()};
     u64 captures{};
     u64 screenshots{};
+    u64 samples{};
     u64 gpu_reads{};
     std::atomic<bool> stopping{};
 };
@@ -377,6 +379,17 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+json SampleThreads(ToolState& state, const json& params) {
+    const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
+    const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
+    std::filesystem::create_directories(state.dump_directory);
+    const auto path =
+        state.dump_directory / fmt::format("samples-{}-{:03}.txt", state.session, ++state.samples);
+    std::string report = Nx2Sampler::Sample(threads.c_str(), seconds, path.string());
+    report.resize((std::min)(report.size(), Param<size_t>(params, "max_chars", 60000, 0, 4000000)));
+    return {{"file", path.generic_string()}, {"report", std::move(report)}};
+}
+
 json ReadMemory(ToolState& state, const json& params) {
     const u64 address = AddressParam(params, "address");
     const u64 size = ReadSize(params, address);
@@ -569,6 +582,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"sample", handler(SampleThreads)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},

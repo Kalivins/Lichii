@@ -49,6 +49,9 @@ public:
     /// clears are left out: their writes are visible only after a host-level wait.
     std::bitset<(std::numeric_limits<u16>::max)()> memory_write_mask =
         std::bitset<(std::numeric_limits<u16>::max)()>{}.set();
+    /// A Maxwell3D whose CallMethod takes its fast path (Nx2Perf): GpuSplit's back calls it
+    /// without the virtual call.
+    bool fast_maxwell3d{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};

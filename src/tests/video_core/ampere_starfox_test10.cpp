@@ -330,6 +330,11 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
     auto indexed = CapturedUniformLoad;
     SetBits(indexed, 0, 12, 0xabb);
     SetBits(indexed, 91, 1, 1);
+    // Ocarina of Time loads U8 and U16 values through an index register.
+    const auto indexed_load = LowerToMaxwell(std::array{indexed, Exit});
+    INFO(indexed_load.error);
+    CHECK(indexed_load);
+    SetBits(indexed, 73, 3, 1);
     CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
 }
 

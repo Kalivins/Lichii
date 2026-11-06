@@ -123,6 +123,22 @@ TOOLS = [
         },
     },
     {
+        "name": "sample",
+        "description": "Sampling profiler: pauses the named host threads about 1000 times a second "
+                       "for the given seconds and returns where they were (self, self <- caller, "
+                       "inclusive counts per function). Also writes the report and its folded "
+                       "stacks to the dump directory. Windows only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threads": {"type": "string",
+                            "description": "Comma separated thread names; default GPU,GPUBack"},
+                "seconds": {"type": "number", "minimum": 1, "maximum": 60},
+                "max_chars": {"type": "integer", "minimum": 0},
+            },
+        },
+    },
+    {
         "name": "read_memory",
         "description": "Reads up to 64 KiB of the game's guest virtual memory, read only and "
                        "while it runs. 'as' formats it: hex (default), u32, u64 (hex strings) or "
@@ -281,6 +297,8 @@ def default_timeout(name, params):
     """The emulator's own timeout_s default, so the adapter waits at least as long."""
     if name == "capture_frame":
         return 120
+    if name == "sample":
+        return int(params.get("seconds", 10)) + 90
     if name in ("input", "input_sequence"):
         steps = params.get("steps", []) if name == "input_sequence" else [params]
         return sum(int(step.get("frames", 0)) for step in steps) // 20 + 10

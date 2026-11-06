@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -143,7 +144,8 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel);
+        bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
+        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
 
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                      const ShaderInfo* shader);
@@ -175,6 +177,8 @@ private:
     bool use_vulkan_pipeline_cache{};
     bool oot_visual_workaround{};
     u64 visual_workaround_title{};
+    const size_t num_pipeline_workers;
+    EmissionBudget emission_budget;
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
@@ -189,6 +193,8 @@ private:
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;
+    std::mutex spare_pools_mutex;
+    std::vector<std::shared_ptr<ShaderPools>> spare_pools;
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;

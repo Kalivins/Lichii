@@ -367,6 +367,8 @@ struct HalfIR {
                 visitor.SHF_r_imm(word);
             else if ((word >> 48) == 0x5c48)
                 visitor.SHL_reg(word);
+            else if ((word >> 48) == 0x5c18)
+                visitor.ISCADD_reg(word);
             else if (((word >> 48) & 0xfffc) == 0x5c10)
                 visitor.IADD_reg(word);
             else if ((word & 0xfc00000000000000ULL) == 0x1c00000000000000ULL)
@@ -572,6 +574,57 @@ TEST_CASE("Ocarina packed float-to-byte conversion clamps before packing", "[vid
         const u32 expected = std::isnan(input) ? 0U : u32(std::clamp(input, 0.0f, 255.0f));
         CHECK(translation.Run(std::bit_cast<u32>(input), 9, 10) == expected);
     }
+}
+
+TEST_CASE("Ocarina I2F from a uniform register selects any byte", "[video_core][ampere][oot]") {
+    // I2F.F32.U8 R9, UR17.B3
+    const Instruction convert{{0x00097d06, 0x30000011, 0x08001000, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{convert, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    CHECK(lowered.instructions[lowered.source_instruction_offsets[0]] ==
+          (0x5cb8000000070000ULL | 9 | (u64{2} << 8) | (u64{233} << 20) | (u64{3} << 41)));
+}
+
+TEST_CASE("Ocarina F2IP packs two rounded unorm bytes", "[video_core][ampere][oot]") {
+    // F2IP.U8.F32 R41, R40, R39, RZ, from a compute program that scales both inputs by 255.
+    const Instruction convert{{0x28297243, 0x27, 0x000004ff, 0x000fc400}};
+    const auto lowered = LowerToMaxwell(std::array{convert, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    HalfIR translation{lowered.instructions};
+    const auto byte = [](f32 input) {
+        return std::isnan(input) ? 0U : u32(std::nearbyintf(std::clamp(input, 0.0f, 255.0f)));
+    };
+    const std::array inputs{-std::numeric_limits<f32>::infinity(), -1.0f, 0.0f, 0.25f, 0.75f, 127.5f,
+                            128.5f, 254.75f, 255.0f, 300.0f, std::numeric_limits<f32>::infinity(),
+                            std::numeric_limits<f32>::quiet_NaN()};
+    for (const f32 a : inputs) {
+        for (const f32 b : inputs) {
+            CAPTURE(a, b);
+            translation.values.clear();
+            translation.registers.fill(0xdeadbeef);
+            translation.registers[40] = std::bit_cast<u32>(a);
+            translation.registers[39] = std::bit_cast<u32>(b);
+            for (const auto& inst : translation.block.Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::SetRegister)
+                    translation.registers.at(static_cast<size_t>(inst.Arg(0).Reg())) =
+                        u32(translation.Value(inst.Arg(1)));
+                else
+                    translation.values.emplace(&inst, translation.Evaluate(inst));
+            }
+            CHECK(translation.registers[41] == (byte(b) | (byte(a) << 8)));
+            CHECK(translation.registers[40] == std::bit_cast<u32>(a));
+            CHECK(translation.registers[39] == std::bit_cast<u32>(b));
+        }
+    }
+    // Other rounding modes and a merge register aren't known forms yet.
+    auto modified = convert;
+    modified.words[2] = 0x000044ff;
+    CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
+    modified = convert;
+    modified.words[2] = 0x00000406;
+    CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
 }
 
 TEST_CASE("Ocarina uniform multiply adds an immediate rather than reading a register",
@@ -978,6 +1031,110 @@ TEST_CASE(
             }
         }
     }
+}
+
+TEST_CASE("Ocarina call links stay proven across a predicate-to-register write",
+          "[video_core][ampere][fast_fusion_logged]") {
+    std::array<Instruction, 7> code{{
+        {{0x00097802, 0x30, 0xf00, 0}},
+        {{0xff107803, 0x40, 0, 0}}, // P2R R16, RZ, 0x40
+        {{0x00007944, 0x10, 0x03c00000, 0}},
+        Exit,
+        CapturedImmediatePackedFloatTrunc,
+        {{0x00047202, 9, 0xf00, 0}},
+        {{0x04007950, 0xffffff90, 0x03c3ffff, 0}},
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    code[1] = {{0xff097803, 0x40, 0, 0}}; // Writes the link register itself.
+    const auto clobbered = LowerToMaxwell(code);
+    CHECK_FALSE(clobbered);
+    CHECK(clobbered.error == "native call linkage mode");
+}
+
+TEST_CASE("Ocarina uniform LEA carries through any UP and preserves the rest",
+          "[video_core][ampere][fast_fusion_logged]") {
+    // ULEA UR10, UR6, UR10, 2 with the carry out in UP2, from Ocarina of Time.
+    constexpr Instruction captured{{0x060a7291, 0x0000000a, 0x0f84103f, 0x000fe200}};
+    constexpr u32 ur6 = 222, ur10 = 226;
+    constexpr std::array values{0U, 1U, 0x3fffffffU, 0x40000000U, 0xffffffffU};
+    for (u32 up = 0; up < 7; ++up) {
+        const u32 mask = 1U << (6 - up);
+        auto instruction = captured;
+        instruction.words[2] = (instruction.words[2] & ~(7U << 17)) | (up << 17);
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        CAPTURE(up);
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        LoggedMachine machine;
+        for (u32 a : values) {
+            for (u32 b : values) {
+                for (u32 packed : {0x12340015U, 0x1234006aU}) {
+                    machine.registers[0][ur6] = a;
+                    machine.registers[0][ur10] = b;
+                    machine.registers[0][239] = packed;
+                    const auto before = machine.registers[0];
+                    const auto predicates = machine.predicates;
+                    machine.Run(lowered.instructions);
+                    CAPTURE(a, b, packed);
+                    const u32 sum = (a << 2) + b;
+                    for (u32 reg = 0; reg < 246; ++reg)
+                        CHECK(machine.registers[0][reg] ==
+                              (reg == ur10  ? sum
+                               : reg == 239 ? (packed & ~mask) | (sum < b ? mask : 0)
+                                            : before[reg]));
+                    CHECK(machine.predicates == predicates);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Ocarina indexed uniform constant loads keep their U8 and U16 widths",
+          "[video_core][ampere][fast_fusion_logged]") {
+    struct Case {
+        Instruction instruction;
+        u64 target, index, offset, bank, width;
+    };
+    // ULDC UR, c[bank][UR + offset] from Ocarina of Time's compute programs.
+    const std::array cases{
+        Case{{{0x11047abb, 0x01400000, 0x08000400, 0x000fe400}}, 220, 233, 0x00, 5, 2},
+        Case{{{0x06077abb, 0x01002080, 0x08000000, 0x000fe400}}, 223, 222, 0x82, 4, 0},
+        Case{{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}}, 220, 229, 0x03, 5, 0},
+        Case{{{0x06087abb, 0x01002080, 0x08000000, 0x000fe400}}, 224, 222, 0x82, 4, 0},
+    };
+    for (const Case& test : cases) {
+        CAPTURE(test.instruction.words[0]);
+        const auto lowered = LowerToMaxwell(std::array{test.instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        CHECK(lowered.instructions[lowered.source_instruction_offsets[0]] ==
+              (0xef90000000070000ULL | test.target | (test.index << 8) | (test.offset << 20) |
+               (test.bank << 36) | (test.width << 48)));
+    }
+    // @UP0 with an index register and offset -1: the guard moves, the signed offset stays.
+    const Instruction negative{{0x0f070abb, 0x013fffc0, 0x08000000, 0x000fe400}};
+    const auto guarded = LowerToMaxwell(std::array{negative, Exit});
+    INFO(guarded.error);
+    REQUIRE(guarded);
+    const u64 load = 0xef90000000060000ULL | 223 | (u64{231} << 8) | (u64{0xffff} << 20) | (u64{4} << 36);
+    CHECK(std::ranges::find(guarded.instructions, load) != guarded.instructions.end());
+    const u64 transfer = 0x38f0000000070000ULL | (u64{239} << 8) | (u64{1U << 6} << 20);
+    CHECK(std::ranges::find(guarded.instructions, transfer) != guarded.instructions.end());
+    // An indexed load can have any immediate: the register can align it (ULDC.32 at UR15 + 0x29).
+    const Instruction indexed_word{{0x0f077abb, 0x01000a40, 0x08000800, 0x000fc600}};
+    const auto word = LowerToMaxwell(std::array{indexed_word, Exit});
+    INFO(word.error);
+    REQUIRE(word);
+    CHECK(word.instructions[word.source_instruction_offsets[0]] ==
+          (0xef90000000070000ULL | 223 | (u64{231} << 8) | (u64{0x29} << 20) | (u64{4} << 36) |
+           (u64{4} << 48)));
+    // A direct U16 load needs an even offset, and a direct subword load the short offset range.
+    Instruction misaligned{{0x00077ab9, 0x01000040, 0x00000400, 0x000fe400}};
+    CHECK_FALSE(LowerToMaxwell(std::array{misaligned, Exit}));
+    Instruction far{{0x00077ab9, 0x01200000, 0x00000000, 0x000fe400}};
+    CHECK_FALSE(LowerToMaxwell(std::array{far, Exit}));
 }
 
 TEST_CASE("Ocarina uniform immediate add carries through any UP and preserves the rest",

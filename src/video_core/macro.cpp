@@ -33,6 +33,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
+#include "video_core/query_dma.h"
 
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -1437,6 +1438,14 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
                     // fence: write them out, or occlusion predicates read stale values. The split only
                     // runs with immediate payload writes, and the query cache belongs to its back.
+                    const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
+                                             VideoCommon::GpuSplit::OnBackThread();
+                    if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&
+                        VideoCommon::QueryDma::HasPendingQueries(memory, maxwell3d.Rasterizer(),
+                                                                 source, read_bytes)) {
+                        VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
+                                                     source, read_bytes);
+                    }
                     if (!VideoCommon::GpuSplit::Get().Active()) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
                     }

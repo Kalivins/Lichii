@@ -148,6 +148,8 @@ public:
     void FlushCommands();
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache();
+    /// Returns true when guest CPU writes to the range are collected but not yet applied.
+    [[nodiscard]] bool HasPendingCPUWrites(DAddr addr, u64 size);
     /// Signal the ending of command list.
     void OnCommandListEnd();
 

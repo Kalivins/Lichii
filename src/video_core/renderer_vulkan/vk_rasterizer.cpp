@@ -770,6 +770,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
+    TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
@@ -1137,12 +1138,18 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
 
         if (mesh_draw) {
-            scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
             });
             return;
         }
         scheduler.Record([this, draw_params, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
+            }
             scheduler.TraceGpuWork(
                 cmdbuf, hashes.first, hashes.second,
                 {draw_params.num_vertices, draw_params.num_instances, 0}, [&] {
@@ -1202,8 +1209,11 @@ void RasterizerVulkan::DrawIndirect() {
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
         if (params.is_byte_count) {
-            scheduler.Record([buffer_obj = buffer->Handle(), offset,
+            scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
                               stride = params.stride](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
                                                 static_cast<u32>(stride));
             });
@@ -1213,9 +1223,12 @@ void RasterizerVulkan::DrawIndirect() {
             const auto count = buffer_cache.GetDrawIndirectCount();
             const auto& draw_buffer = count.first;
             const auto& offset_base = count.second;
-            scheduler.Record([draw_buffer_obj = draw_buffer->Handle(),
+            scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
                               buffer_obj = buffer->Handle(), offset_base, offset,
                               params](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirectCount(
                         buffer_obj, offset, draw_buffer_obj, offset_base,
@@ -1230,6 +1243,9 @@ void RasterizerVulkan::DrawIndirect() {
         }
         scheduler.Record([this, buffer_obj = buffer->Handle(), offset, params,
                           hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
+            }
             scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {}, [&] {
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
@@ -1734,6 +1750,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
         frame_dump.CaptureDispatch(pipeline->ShaderHash(), written);
     };
+    TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()});
     if (frame_dump.CapturingSampled()) {
         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
         for (const auto& image : pipeline->SampledImages()) {
@@ -1851,7 +1868,9 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
+    // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
+    // the longer DeferFlush interval (#161).
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
 }
@@ -1920,6 +1939,10 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
         return texture_cache.IsRegionGpuModified(addr, size);
     }
     return false;
+}
+
+bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
+    return query_cache.IsRegionGpuModified(addr, size);
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
@@ -2192,12 +2215,9 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    if (device.IsMoltenVK()) {
-        scheduler.DeferFragmentBarrier();
-        return;
-    }
-    // We already put barriers when a render pass finishes
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // The next draw breaks the render pass only if it reads what this one wrote (#161): Ocarina
+    // ended ~5,900 render passes a second here.
+    scheduler.DeferFragmentBarrier();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
@@ -2285,6 +2305,36 @@ void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
     LOG_DEBUG(Render_Vulkan, "Render trace condition: address={:#x} mode={} override={}",
               regs.render_enable.Address(), static_cast<u32>(regs.render_enable.mode),
               static_cast<u32>(regs.render_enable_override));
+}
+
+void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes) {
+    // Guest CPU writes into GPU-written buffer memory are collected, and applied to the host
+    // buffers only at the next fence or cache invalidation. A hit here reads the older bytes.
+    static const bool enabled = std::getenv("EDEN_NX2_PENDING_WRITE_TRACE") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static constexpr u64 max_lines = 100000;
+    static u64 lines{};
+    buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
+                                                 const auto& binding, u32 bound_size,
+                                                 const auto*, u32) {
+        if (lines > max_lines || !gpu.HasPendingCPUWrites(binding.device_addr, bound_size)) {
+            return;
+        }
+        if (++lines > max_lines) {
+            LOG_INFO(HW_GPU, "Pending write trace stopped after {} lines", max_lines);
+            return;
+        }
+        const size_t program = compute ? 0 : stage + 1;
+        LOG_INFO(HW_GPU,
+                 "Pending CPU write frame={} {} shader={:016x} stage={} {}[{}]{} addr={:#x} "
+                 "device={:#x} size={:#x}",
+                 render_trace_frame, compute ? "dispatch" : "draw",
+                 program < shader_hashes.size() ? shader_hashes[program] : 0, stage,
+                 storage ? "ssbo" : "cbuf", index, written ? " written" : "", binding.gpu_addr,
+                 binding.device_addr, bound_size);
+    });
 }
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
@@ -2591,21 +2641,23 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
-    u32 budget = SubmissionPolicy::DefaultNativeBudget;
+    // The 128-draw native budget is tuned for MoltenVK; desktop Vulkan takes the legacy 4096 (#161).
+    const u32 default_native_budget =
+        !device.IsMoltenVK() ? 4096U : SubmissionPolicy::DefaultNativeBudget;
+    u32 budget = default_native_budget;
     if (native && !android) {
-        static const u32 configured_budget = [] {
+        static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
             if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
                 if (const auto parsed = SubmissionPolicy::ParseBudget(value)) {
-                    return *parsed;
+                    return parsed;
                 }
                 LOG_WARNING(Render_Vulkan,
-                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}, "
-                            "using {}",
-                            (std::numeric_limits<u32>::max)(), SubmissionPolicy::DefaultNativeBudget);
+                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}",
+                            (std::numeric_limits<u32>::max)());
             }
-            return SubmissionPolicy::DefaultNativeBudget;
+            return std::nullopt;
         }();
-        budget = configured_budget;
+        budget = configured_budget.value_or(default_native_budget);
     }
     u32 legacy_budget = 4096;
     if (!native && !android) {
