@@ -131,6 +131,20 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
+    /// Native program key of the compute program CurrentComputePipeline last looked up (0 when it
+    /// found none or the program is not native code), for the frame dump's launch rows.
+    u64 last_compute_native_key{};
+
+    /// Native program keys of the current graphics stage slots (0 when off or not native code).
+    [[nodiscard]] std::array<u64, 6> StageNativeKeys() const noexcept {
+        std::array<u64, 6> keys{};
+        for (size_t index = 0; index < keys.size() && index < shader_infos.size(); ++index) {
+            const ShaderInfo* const info = shader_infos[index];
+            keys[index] = info && info->lowered_native ? info->lowered_native->native_program_key : 0;
+        }
+        return keys;
+    }
+
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 

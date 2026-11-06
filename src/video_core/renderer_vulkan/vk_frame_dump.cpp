@@ -542,10 +542,12 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
 
 void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
                            const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
-                           std::optional<std::array<u32, 3>> indirect_grid) {
+                           std::optional<std::array<u32, 3>> indirect_grid, GPUVAddr program,
+                           u64 native_key) {
     std::string tags = fmt::format(
-        R"({{"kind":"launch","dispatch":{},"after_draws":{},"shaders":["{:016x}"],"grid":[{},{},{}],"block":[{},{},{}])",
-        dispatches, draws, shader_hash, grid[0], grid[1], grid[2], block[0], block[1], block[2]);
+        R"({{"kind":"launch","dispatch":{},"after_draws":{},"shaders":["{:016x}"],"program":"{:#x}","key":"{:016x}","grid":[{},{},{}],"block":[{},{},{}])",
+        dispatches, draws, shader_hash, program, native_key, grid[0], grid[1], grid[2], block[0],
+        block[1], block[2]);
     if (indirect) {
         tags += fmt::format(R"(,"indirect":"{:#x}")", *indirect);
     }
@@ -583,6 +585,20 @@ void FrameDump::NoteSkipped(bool compute, u64 program, GPUVAddr rt0, std::string
     Enqueue({.tags = fmt::format(
                  R"({{"kind":"skipped","compute":{},"after_draws":{},"after_dispatches":{},"program":"{:#x}","rt0":"{:#x}","reason":"{}"}})",
                  compute, draws, dispatches, program, rt0, text)});
+}
+
+void FrameDump::NotePrograms(std::span<const u64> shader_hashes,
+                             std::span<const u64> native_keys) {
+    std::string hashes;
+    for (const u64 hash : shader_hashes) {
+        hashes += fmt::format(R"({}"{:016x}")", hashes.empty() ? "" : ",", hash);
+    }
+    std::string keys;
+    for (const u64 key : native_keys) {
+        keys += fmt::format(R"({}"{:016x}")", keys.empty() ? "" : ",", key);
+    }
+    Enqueue({.tags = fmt::format(R"({{"kind":"programs","pass":{},"draw":{},"hashes":[{}],"keys":[{}]}})",
+                                 pass_index, draws - 1, hashes, keys)});
 }
 
 void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
@@ -652,6 +668,10 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
     const size_t size = TargetBytes(target);
     if (recorded_bytes + size > SizeCap()) {
         truncated = true;
+        Enqueue({.tags = fmt::format(
+                     R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"gpu_addr":"{:#x}","skipped":"cap"}})",
+                     name, tags, target.format, target.width, target.height, target.depth,
+                     target.gpu_addr)});
         return false;
     }
     recorded_bytes += size;
@@ -706,6 +726,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
 bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
     if (recorded_bytes + size > SizeCap()) {
         truncated = true;
+        Enqueue({.tags = "{" + tags + R"(,"skipped":"cap"})"});
         return false;
     }
     recorded_bytes += size;

@@ -785,6 +785,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             recorded = frame_dump.NoteSampled(sampled);
         }
         if (frame_dump.CapturingBuffers()) {
+            frame_dump.NotePrograms(pipeline->ShaderHashes(), pipeline_cache.StageNativeKeys());
             recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
         }
         if (recorded) {
@@ -1737,6 +1738,12 @@ void RasterizerVulkan::DispatchCompute() {
     };
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow)) {
+        if (frame_dump.Capturing()) {
+            frame_dump.NoteSkipped(true,
+                                   kepler_compute->regs.code_loc.Address() +
+                                       kepler_compute->launch_description.program_start,
+                                   0, "resources unavailable");
+        }
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
@@ -1775,7 +1782,9 @@ void RasterizerVulkan::DispatchCompute() {
         frame_dump.NoteLaunch(pipeline->ShaderHash(),
                               {qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z},
                               {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
-                              indirect_address, indirect_grid);
+                              indirect_address, indirect_grid,
+                              kepler_compute->regs.code_loc.Address() + qmd.program_start,
+                              pipeline_cache.last_compute_native_key);
     }
     if (indirect_address) {
         // DispatchIndirect

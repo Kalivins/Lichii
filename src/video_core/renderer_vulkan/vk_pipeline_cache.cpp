@@ -814,10 +814,13 @@ ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
-
+    last_compute_native_key = 0;
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
         return nullptr;
+    }
+    if (shader->lowered_native) {
+        last_compute_native_key = shader->lowered_native->native_program_key;
     }
     const auto& qmd{kepler_compute->launch_description};
     const ComputePipelineCacheKey key{

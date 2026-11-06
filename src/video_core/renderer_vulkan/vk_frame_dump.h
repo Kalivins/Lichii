@@ -145,10 +145,14 @@ public:
     /// to run not yet seen for their shader. Returns true when copies were recorded.
     bool NoteBuffers(bool compute, std::span<const u64> shader_hashes,
                      std::span<BoundBuffer> buffers);
-    /// Records the group counts of the dispatch about to run.
+    /// Records the group counts of the dispatch about to run, with its program's GPU address and
+    /// native program key (the shader dump's file name key; 0 when not native).
     void NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
                     const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
-                    std::optional<std::array<u32, 3>> indirect_grid);
+                    std::optional<std::array<u32, 3>> indirect_grid, GPUVAddr program,
+                    u64 native_key);
+    /// Records the shader hash and native program key of every stage slot of the current draw.
+    void NotePrograms(std::span<const u64> shader_hashes, std::span<const u64> native_keys);
 
     /// Starts a pass when the framebuffer changes and captures the previous one.
     /// Returns true when copies were recorded, which ends the current render pass.
