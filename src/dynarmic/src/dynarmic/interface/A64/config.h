@@ -301,6 +301,10 @@ struct UserConfig {
         static constexpr std::uint64_t no_entry = ~std::uint64_t{0};
         std::uint64_t (*index_of)(std::uint64_t pc) = nullptr;
         void (*count)(std::uint64_t index) = nullptr;
+        /// The block counted under args_index calls count_args with its first two arguments
+        /// (X1 and X2) in place of count.
+        std::uint64_t args_index = no_entry;
+        void (*count_args)(std::uint64_t index, std::uint64_t x1, std::uint64_t x2) = nullptr;
     };
     const BlockEntryCounter* block_entry_counter = nullptr;
 

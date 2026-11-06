@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -38,6 +40,11 @@
 /// 1000): milliseconds since the module loaded, frames presented so far, then the total entries
 /// of each slot. Calls per frame are the difference of two lines over their presents. In ptr mode
 /// the slots' addresses are written to the same path with .slots appended, each time they change.
+/// EDEN_NX2_CALL_ARGS_SLOT=<slot> also keeps, for the block counted under that slot, how often it
+/// was entered with each pair of first arguments (X1, low 32 bits of X2), and appends the pairs
+/// whose count changed to the same path with .args appended, one line per pair: milliseconds,
+/// frames presented, X1, X2, entries so far. For nvnCommandBufferBindProgram that is the program
+/// and the stage bits of every bind.
 namespace Core::Nx2CallCount {
 
 inline constexpr size_t MaxSlots = 4096;
@@ -64,6 +71,15 @@ inline void CountEntry(u64 index) {
     if (index < MaxSlots) {
         g_counts[index].fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+inline std::mutex g_args_mutex;
+inline std::map<std::pair<u64, u64>, u64> g_args;
+
+inline void CountEntryArgs(u64 index, u64 x1, u64 x2) {
+    CountEntry(index);
+    std::scoped_lock lock{g_args_mutex};
+    ++g_args[{x1, x2 & 0xffffffffULL}];
 }
 
 inline u64 IndexOf(u64 pc) {
@@ -131,6 +147,11 @@ inline const Spec& GetSpec() {
         if (parsed.valid) {
             g_counter.index_of = &IndexOf;
             g_counter.count = &CountEntry;
+            if (const char* const slot = std::getenv("EDEN_NX2_CALL_ARGS_SLOT");
+                slot != nullptr && *slot != '\0') {
+                g_counter.args_index = std::strtoull(slot, nullptr, 0);
+                g_counter.count_args = &CountEntryArgs;
+            }
         }
         return parsed;
     }();
@@ -158,6 +179,10 @@ inline void StartWriter(const Spec& spec) {
             return;
         }
         std::fprintf(file, "# ms presents then the entries of each of %zu slots\n", slots);
+        std::FILE* const args_file = g_counter.count_args != nullptr
+                                         ? std::fopen((path + ".args").c_str(), "w")
+                                         : nullptr;
+        std::map<std::pair<u64, u64>, u64> args_written;
         const auto start = std::chrono::steady_clock::now();
         std::string line;
         for (;;) {
@@ -174,6 +199,26 @@ inline void StartWriter(const Spec& spec) {
             line += '\n';
             std::fputs(line.c_str(), file);
             std::fflush(file);
+            if (args_file != nullptr) {
+                std::map<std::pair<u64, u64>, u64> args;
+                {
+                    std::scoped_lock lock{g_args_mutex};
+                    args = g_args;
+                }
+                const u64 presents = g_nx2_present_count.load(std::memory_order_relaxed);
+                for (const auto& [pair, total] : args) {
+                    if (u64& written = args_written[pair]; written != total) {
+                        written = total;
+                        std::fprintf(args_file, "%lld %llu 0x%llx 0x%llx %llu\n",
+                                     static_cast<long long>(elapsed.count()),
+                                     static_cast<unsigned long long>(presents),
+                                     static_cast<unsigned long long>(pair.first),
+                                     static_cast<unsigned long long>(pair.second),
+                                     static_cast<unsigned long long>(total));
+                    }
+                }
+                std::fflush(args_file);
+            }
         }
     }}.detach();
     LOG_INFO(Core_ARM, "EDEN_NX2_CALL_COUNT: {} slots, every {} ms to {}", spec.slots, period,

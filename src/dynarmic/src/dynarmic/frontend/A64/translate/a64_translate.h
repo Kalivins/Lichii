@@ -43,6 +43,8 @@ struct TranslationOptions {
     /// (UserConfig::block_entry_counter).
     u64 entry_count_index = 0;
     void (*entry_count)(u64 index) = nullptr;
+    /// When set, called in place of entry_count with the block's X1 and X2 as well.
+    void (*entry_count_args)(u64 index, u64 x1, u64 x2) = nullptr;
 };
 
 /**

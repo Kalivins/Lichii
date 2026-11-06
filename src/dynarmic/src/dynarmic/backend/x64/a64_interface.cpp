@@ -264,6 +264,9 @@ private:
             if (index != UserConfig::BlockEntryCounter::no_entry) {
                 options.entry_count_index = index;
                 options.entry_count = counter->count;
+                if (index == counter->args_index && counter->count_args != nullptr) {
+                    options.entry_count_args = counter->count_args;
+                }
             }
         }
         A64::Translate(ir_block, arch_descriptor, get_code, options);

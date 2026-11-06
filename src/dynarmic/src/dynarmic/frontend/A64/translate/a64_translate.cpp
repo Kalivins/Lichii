@@ -19,9 +19,13 @@ namespace Dynarmic::A64 {
 void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options) {
     const bool single_step = descriptor.SingleStepping();
     const auto entry_count = options.entry_count;
+    const auto entry_count_args = options.entry_count_args;
     const u64 entry_index = options.entry_count_index;
     TranslatorVisitor visitor{block, descriptor, std::move(options)};
-    if (entry_count != nullptr) {
+    if (entry_count_args != nullptr) {
+        visitor.ir.CallHostFunction(entry_count_args, visitor.ir.Imm64(entry_index),
+                                    visitor.ir.GetX(Reg::R1), visitor.ir.GetX(Reg::R2));
+    } else if (entry_count != nullptr) {
         visitor.ir.CallHostFunction(entry_count, visitor.ir.Imm64(entry_index));
     }
 
