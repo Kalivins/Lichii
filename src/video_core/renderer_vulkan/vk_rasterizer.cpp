@@ -64,6 +64,7 @@
 #include "video_core/nx2_draw_runs.h"
 #include "common/nx2_sample_profile.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_mesh_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -1772,6 +1773,21 @@ void RasterizerVulkan::DispatchCompute() {
 
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    if (VideoCommon::Nx2MeshTrace::Active()) [[unlikely]] {
+        std::string written;
+        buffer_cache.ForEachBoundBuffer(
+            true, [&](u32, bool storage, u32, bool is_written, const auto& binding, u32 bound_size,
+                      const auto*, u32) {
+                if (storage && is_written) {
+                    written += fmt::format("{}{:x}:{}", written.empty() ? "" : "+",
+                                           binding.gpu_addr, bound_size);
+                }
+            });
+        VideoCommon::Nx2MeshTrace::NoteDispatch(
+            kepler_compute->regs.code_loc.Address() + qmd.program_start,
+            {qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z},
+            indirect_address ? *indirect_address : 0, written);
+    }
     if (frame_dump.CapturingBuffers()) {
         std::optional<std::array<u32, 3>> indirect_grid;
         if (indirect_address) {
@@ -2428,6 +2444,7 @@ void RasterizerVulkan::TickFrame() {
         }
     }
     frame_dump.TickFrame();
+    VideoCommon::Nx2MeshTrace::TickFrame();
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;

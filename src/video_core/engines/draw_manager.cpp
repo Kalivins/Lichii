@@ -12,6 +12,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_draw_runs.h"
+#include "video_core/nx2_mesh_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
 
@@ -35,6 +36,18 @@ void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
                   static_cast<u32>(regs.render_enable.mode),
                   static_cast<u32>(regs.render_enable_override));
     }
+}
+
+std::array<u64, 6> StagePrograms(const Maxwell3D& maxwell3d) {
+    const auto& regs = maxwell3d.regs;
+    std::array<u64, 6> programs{};
+    for (size_t i = 0; i < programs.size(); ++i) {
+        if (regs.IsShaderConfigEnabled(i)) {
+            programs[i] =
+                (u64{regs.pipelines[i].reserved[0] & 0xff} << 32) | regs.pipelines[i].reserved[1];
+        }
+    }
+    return programs;
 }
 
 } // namespace
@@ -346,6 +359,13 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
+    if (VideoCommon::Nx2MeshTrace::Active() && maxwell3d.regs.IsMeshEnabled()) [[unlikely]] {
+        VideoCommon::Nx2MeshTrace::NoteMeshDraw(
+            draw_indexed ? draw_state.index_buffer.first : draw_state.vertex_buffer.first,
+            draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count,
+            instance_count, draw_indexed, false, maxwell3d.ShouldExecute(),
+            StagePrograms(maxwell3d));
+    }
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::Nx2DrawRuns::g_enabled) [[unlikely]] {
             VideoCommon::Nx2DrawRuns::OnDraw(static_cast<u32>(draw_state.topology), false);
@@ -360,6 +380,15 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     draw_state.draw_element_count = 0;
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
+    if (VideoCommon::Nx2MeshTrace::Active() && maxwell3d.regs.IsMeshEnabled()) [[unlikely]] {
+        VideoCommon::Nx2MeshTrace::NoteMeshDraw(0, 0, 0, indirect_state.is_indexed, true,
+                                                maxwell3d.ShouldExecute(),
+                                                StagePrograms(maxwell3d));
+        VideoCommon::Nx2MeshTrace::NoteIndirect(
+            indirect_state.indirect_start_address, indirect_state.buffer_size,
+            indirect_state.max_draw_counts, indirect_state.stride,
+            indirect_state.include_count ? indirect_state.count_start_address : 0);
+    }
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::Nx2DrawRuns::g_enabled) [[unlikely]] {
             VideoCommon::Nx2DrawRuns::OnDraw(static_cast<u32>(draw_state.topology), true);

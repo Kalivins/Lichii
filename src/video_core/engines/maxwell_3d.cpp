@@ -27,6 +27,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_draw_runs.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_mesh_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -590,8 +591,16 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
         ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
 
     // Execute the current macro.
+    const bool mesh_trace = VideoCommon::Nx2MeshTrace::Active();
+    if (mesh_trace) [[unlikely]] {
+        VideoCommon::Nx2MeshTrace::BeginMacro(*this, method, GetNativeMacroPositions()[entry],
+                                              parameters);
+    }
     GetNativeMacroEngine().Execute(system, *this, GetNativeMacroPositions()[entry], parameters);
     draw_manager.DrawDeferred(*this);
+    if (mesh_trace) [[unlikely]] {
+        VideoCommon::Nx2MeshTrace::EndMacro();
+    }
 }
 
 void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {

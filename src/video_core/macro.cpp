@@ -40,6 +40,7 @@
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_mesh_trace.h"
 #include "video_core/nx2_profile.h"
 
 namespace Tegra {
@@ -1435,6 +1436,12 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                             }
                         }
                     }
+                    std::array<u32, 16> guest_words{};
+                    const u32 guest_count = std::min<u32>(value, 16);
+                    const bool mesh_trace = VideoCommon::Nx2MeshTrace::Active();
+                    if (mesh_trace) [[unlikely]] {
+                        memory.ReadWordsUnsafe(source, guest_words.data(), guest_count);
+                    }
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
                     // fence: write them out, or occlusion predicates read stale values. The split only
                     // runs with immediate payload writes, and the query cache belongs to its back.
@@ -1449,7 +1456,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     if (!VideoCommon::GpuSplit::Get().Active()) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
                     }
-                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                    const bool dirty_read =
+                        memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                    if (dirty_read) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                         static u64 flushes{};
                         if (++flushes % 2000 == 1) {
@@ -1467,6 +1476,12 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     const u32 word_count = std::min<u32>(value, 0x1000);
                     std::array<u32, 0x1000> dma_words;
                     memory.ReadWordsUnsafe(source, dma_words.data(), word_count);
+                    if (mesh_trace) [[unlikely]] {
+                        VideoCommon::Nx2MeshTrace::NoteRead(
+                            source, value, address == DmaReadFifoed, dirty_read,
+                            std::span<const u32>{guest_words.data(), guest_count},
+                            std::span<const u32>{dma_words.data(), word_count});
+                    }
                     for (u32 i = 0; i < word_count; ++i) {
                         const u32 word = dma_words[i];
                         if (address == DmaReadFifoed) {
