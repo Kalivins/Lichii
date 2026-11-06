@@ -38,6 +38,13 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// A block starting in [entry_count_begin, entry_count_end) on an entry_count_stride
+    /// boundary first calls entry_count with its index (UserConfig::block_entry_counter).
+    u64 entry_count_begin = 0;
+    u64 entry_count_end = 0;
+    u64 entry_count_stride = 4;
+    void (*entry_count)(u64 index) = nullptr;
 };
 
 /**

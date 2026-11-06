@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -292,6 +293,18 @@ struct UserConfig {
     /// This tells the translator a wall clock will be used, thus allowing it
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
+
+    /// Counts entries into blocks that start inside [begin, end) on a stride boundary: such a
+    /// block calls count((pc - begin) / stride) before its first instruction. begin and end are
+    /// read when a block is translated, so they may be set after the JIT is made, as long as no
+    /// block of the range was translated before.
+    struct BlockEntryCounter {
+        std::atomic<std::uint64_t> begin{0};
+        std::atomic<std::uint64_t> end{0};
+        std::uint64_t stride = 4;
+        void (*count)(std::uint64_t index) = nullptr;
+    };
+    const BlockEntryCounter* block_entry_counter = nullptr;
 
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.

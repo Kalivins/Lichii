@@ -16,6 +16,7 @@
 #include "common/logging.h"
 #include "common/random.h"
 #include "common/settings.h"
+#include "core/arm/dynarmic/nx2_call_count.h"
 #include "core/core.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
@@ -525,6 +526,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         next_load_addr = *tentative_next_load_addr;
         modules.insert_or_assign(load_addr, module);
         LOG_DEBUG(Loader, "loaded module {} @ {:#x}", module, load_addr);
+        Core::Nx2CallCount::OnModuleLoaded(module, load_addr);
     }
 
     if (standalone) {

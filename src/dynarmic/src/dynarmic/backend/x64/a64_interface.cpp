@@ -258,7 +258,14 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        A64::TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
+        if (const auto* counter = conf.block_entry_counter; counter != nullptr && counter->count != nullptr) {
+            options.entry_count_begin = counter->begin.load(std::memory_order_relaxed);
+            options.entry_count_end = counter->end.load(std::memory_order_relaxed);
+            options.entry_count_stride = counter->stride;
+            options.entry_count = counter->count;
+        }
+        A64::Translate(ir_block, arch_descriptor, get_code, options);
         Optimization::Optimize(ir_block, conf, polyfill_options);
         return emitter.Emit(ir_block).entrypoint;
     }

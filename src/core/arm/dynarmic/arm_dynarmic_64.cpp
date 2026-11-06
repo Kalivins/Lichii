@@ -13,6 +13,7 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/nx2_call_count.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
@@ -352,6 +353,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
+    config.block_entry_counter = Core::Nx2CallCount::JitCounter();
     config.enable_cycle_counting = !m_uses_wall_clock;
 
     // Code cache size
