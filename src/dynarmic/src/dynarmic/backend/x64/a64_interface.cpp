@@ -259,11 +259,12 @@ private:
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
         A64::TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
-        if (const auto* counter = conf.block_entry_counter; counter != nullptr && counter->count != nullptr) {
-            options.entry_count_begin = counter->begin.load(std::memory_order_relaxed);
-            options.entry_count_end = counter->end.load(std::memory_order_relaxed);
-            options.entry_count_stride = counter->stride;
-            options.entry_count = counter->count;
+        if (const auto* counter = conf.block_entry_counter; counter != nullptr && counter->index_of != nullptr) {
+            const u64 index = counter->index_of(arch_descriptor.PC());
+            if (index != UserConfig::BlockEntryCounter::no_entry) {
+                options.entry_count_index = index;
+                options.entry_count = counter->count;
+            }
         }
         A64::Translate(ir_block, arch_descriptor, get_code, options);
         Optimization::Optimize(ir_block, conf, polyfill_options);

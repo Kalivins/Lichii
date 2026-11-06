@@ -9,7 +9,6 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -294,14 +293,13 @@ struct UserConfig {
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
 
-    /// Counts entries into blocks that start inside [begin, end) on a stride boundary: such a
-    /// block calls count((pc - begin) / stride) before its first instruction. begin and end are
-    /// read when a block is translated, so they may be set after the JIT is made, as long as no
-    /// block of the range was translated before.
+    /// Counts entries into chosen blocks. When a block is translated, index_of(pc) gives the
+    /// index of the block starting at pc, or no_entry; a block with an index calls count(index)
+    /// before its first instruction. index_of may change its answers while the JIT runs: blocks
+    /// translated before keep their old answer until the cache is cleared.
     struct BlockEntryCounter {
-        std::atomic<std::uint64_t> begin{0};
-        std::atomic<std::uint64_t> end{0};
-        std::uint64_t stride = 4;
+        static constexpr std::uint64_t no_entry = ~std::uint64_t{0};
+        std::uint64_t (*index_of)(std::uint64_t pc) = nullptr;
         void (*count)(std::uint64_t index) = nullptr;
     };
     const BlockEntryCounter* block_entry_counter = nullptr;
