@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <cmath>
 #include <cstdlib>
@@ -3777,5 +3778,33 @@ ASSERT_REG_POSITION(shader_performance, 0x333C);
 ASSERT_REG_POSITION(shadow_scratch, 0x3400);
 
 #undef ASSERT_REG_POSITION
+
+/// Writes that reach the 3D engine for rt_control, zeta_enable and the first surface_clip word,
+/// same-value and sunk writes included. A driver binding render targets writes them once per
+/// bind, so the frame dump numbers each pass by the binds before it.
+inline std::array<std::atomic<u64>, 3> g_rt_bind_writes{};
+
+inline void NoteRtBindWrite(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(rt_control):
+        g_rt_bind_writes[0].fetch_add(1, std::memory_order_relaxed);
+        break;
+    case MAXWELL3D_REG_INDEX(zeta_enable):
+        g_rt_bind_writes[1].fetch_add(1, std::memory_order_relaxed);
+        break;
+    case MAXWELL3D_REG_INDEX(surface_clip):
+        g_rt_bind_writes[2].fetch_add(1, std::memory_order_relaxed);
+        break;
+    default:
+        break;
+    }
+}
+
+/// The three counts, read on the thread that runs the 3D engine.
+inline std::array<u64, 3> RtBindWrites() {
+    return {g_rt_bind_writes[0].load(std::memory_order_relaxed),
+            g_rt_bind_writes[1].load(std::memory_order_relaxed),
+            g_rt_bind_writes[2].load(std::memory_order_relaxed)};
+}
 
 } // namespace Tegra::Engines

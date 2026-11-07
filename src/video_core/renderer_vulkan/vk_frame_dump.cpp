@@ -402,12 +402,22 @@ int FrameDump::Decode(const Target& target, const u8* pixel, std::array<float, 4
     return 0;
 }
 
-bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> colors) {
+bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> colors,
+                          ImageView* depth, std::string_view cause,
+                          const std::array<u64, 3>& rt_writes) {
     if (framebuffer == pass_framebuffer) {
         return false;
     }
     const bool recorded = EndPass();
     pass_framebuffer = framebuffer;
+    pass_first_dispatch = dispatches;
+    pass_clears = 0;
+    pass_cause = cause;
+    for (size_t i = 0; i < rt_writes.size(); ++i) {
+        pass_rt_writes[i] = rt_writes[i] - frame_rt_writes[i];
+    }
+    pass_depth = depth ? MakeTarget(*depth, 8) : std::nullopt;
+    pass_depth_view = depth != nullptr;
     pass_targets.clear();
     for (u32 slot = 0; slot < colors.size(); ++slot) {
         if (!colors[slot]) {
@@ -633,15 +643,51 @@ bool FrameDump::EndPass() {
     for (const u64 hash : pass_hashes) {
         shaders += fmt::format("{}\"{:016x}\"", shaders.empty() ? "" : ",", hash);
     }
+    // Every target of the pass goes in each of its rows: slot (8 for depth-stencil), format,
+    // size, level, layer, whether it is rescaled, address.
+    std::string targets;
+    const auto describe = [&targets](const Target& target) {
+        targets += fmt::format(
+            R"({}{{"slot":{},"format":"{}","width":{},"height":{},"level":{},"layer":{},"rescaled":{},"gpu_addr":"{:#x}"}})",
+            targets.empty() ? "" : ",", target.slot, target.format, target.width,
+            target.height, target.level, target.layer, target.rescaled, target.gpu_addr);
+    };
+    for (const Target& target : pass_targets) {
+        describe(target);
+    }
+    if (pass_depth) {
+        describe(*pass_depth);
+    } else if (pass_depth_view) {
+        targets += fmt::format(R"({}{{"slot":8,"format":"unreadable"}})",
+                               targets.empty() ? "" : ",");
+    }
+    const std::string pass_tags = fmt::format(
+        R"("cause":"{}","clears":{},"after_dispatches":{},"rt_writes":[{},{},{}],"targets":[{}])",
+        pass_cause, pass_clears, pass_first_dispatch, pass_rt_writes[0], pass_rt_writes[1],
+        pass_rt_writes[2], targets);
     bool recorded = false;
     for (const Target& target : pass_targets) {
         recorded |= Record(
             target,
             fmt::format("{:04}_pass{:03}_d{}-{}_rt{}", sequence++, pass_index, pass_first_draw,
                         draws, target.slot),
-            fmt::format(R"("kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":{},"shaders":[{}])",
+            fmt::format(R"("kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":{},"shaders":[{}],{})",
                         pass_index, pass_first_draw, draws - pass_first_draw, target.slot,
-                        shaders));
+                        shaders, pass_tags));
+    }
+    if (pass_depth) {
+        recorded |= Record(
+            *pass_depth,
+            fmt::format("{:04}_pass{:03}_d{}-{}_rtz", sequence++, pass_index, pass_first_draw,
+                        draws),
+            fmt::format(R"("kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":8,"shaders":[{}],{})",
+                        pass_index, pass_first_draw, draws - pass_first_draw, shaders,
+                        pass_tags));
+    }
+    if (pass_targets.empty() && !pass_depth) {
+        Enqueue({.tags = fmt::format(
+                     R"({{"kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":-1,"shaders":[{}],{},"skipped":"no-target"}})",
+                     pass_index, pass_first_draw, draws - pass_first_draw, shaders, pass_tags)});
     }
     ++pass_index;
     return recorded;
@@ -955,7 +1001,7 @@ void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
     written_bytes += data.size();
 }
 
-void FrameDump::TickFrame() {
+void FrameDump::TickFrame(const std::array<u64, 3>& rt_writes) {
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     switch (schedule.Tick(elapsed)) {
@@ -986,8 +1032,11 @@ void FrameDump::TickFrame() {
                           static_cast<int>(result));
             }
         }
-        Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index,
-                                     draws, dispatches),
+        Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{},"rt_writes":[{},{},{}])",
+                                     pass_index, draws, dispatches,
+                                     rt_writes[0] - frame_rt_writes[0],
+                                     rt_writes[1] - frame_rt_writes[1],
+                                     rt_writes[2] - frame_rt_writes[2]),
                  .summary = true,
                  .truncated = truncated});
         return;
@@ -1006,6 +1055,7 @@ void FrameDump::TickFrame() {
         schedule.Abort();
         return;
     }
+    frame_rt_writes = rt_writes;
     const u64 frame = schedule.Frame();
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
              << '\n';

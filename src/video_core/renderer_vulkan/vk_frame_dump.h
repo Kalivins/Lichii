@@ -154,9 +154,17 @@ public:
     /// Records the shader hash and native program key of every stage slot of the current draw.
     void NotePrograms(std::span<const u64> shader_hashes, std::span<const u64> native_keys);
 
-    /// Starts a pass when the framebuffer changes and captures the previous one.
-    /// Returns true when copies were recorded, which ends the current render pass.
-    bool BeginPass(const void* framebuffer, std::span<ImageView* const> colors);
+    /// Starts a pass when the framebuffer changes and captures the previous one. `depth` is the
+    /// depth-stencil target or null, `cause` what began the pass (draw, clear, texture) and
+    /// `rt_writes` the 3D engine's render-target bind writes so far (rt_control, zeta_enable,
+    /// surface_clip). Returns true when copies were recorded, which ends the current render pass.
+    bool BeginPass(const void* framebuffer, std::span<ImageView* const> colors,
+                   ImageView* depth, std::string_view cause,
+                   const std::array<u64, 3>& rt_writes);
+    /// Counts a clear in the current pass.
+    void NoteClear() noexcept {
+        ++pass_clears;
+    }
     void NoteDraw(std::span<const u64> shader_hashes);
     /// Starts counting the primitives and fragments of the draw about to be recorded; returns the
     /// query to end after it. Sampled captures only.
@@ -186,7 +194,8 @@ public:
     void CapturePresent(ImageView& view);
     /// Waits for pending readbacks and writes them once they pass the staging budget.
     void DrainIfFull();
-    void TickFrame();
+    /// `rt_writes` as for BeginPass, read at the frame boundary.
+    void TickFrame(const std::array<u64, 3>& rt_writes);
     /// Captures the next frame into `directory` for the debug server, which is told `id` once
     /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
     void Arm(std::filesystem::path directory, bool sampled, bool buffers, u64 id);
@@ -284,6 +293,14 @@ private:
     std::vector<u64> written_buffers;
     u32 pass_index{};
     u32 pass_first_draw{};
+    u32 pass_first_dispatch{};
+    u32 pass_clears{};
+    std::string pass_cause;
+    std::array<u64, 3> pass_rt_writes{};
+    std::optional<Target> pass_depth;
+    bool pass_depth_view{};
+    /// Bind writes when the capture's frame began.
+    std::array<u64, 3> frame_rt_writes{};
     u32 draws{};
     u32 dispatches{};
 

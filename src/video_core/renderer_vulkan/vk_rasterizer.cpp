@@ -773,7 +773,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing()) {
-        FrameDumpPass(texture_cache.GetFramebuffer());
+        FrameDumpPass(texture_cache.GetFramebuffer(), "draw");
         frame_dump.NoteDraw(pipeline->ShaderHashes());
         bool recorded = false;
         if (frame_dump.CapturingSampled()) {
@@ -1443,7 +1443,7 @@ void RasterizerVulkan::DrawTexture() {
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
     const auto* framebuffer = texture_cache.GetFramebuffer();
     if (frame_dump.Capturing()) {
-        FrameDumpPass(framebuffer);
+        FrameDumpPass(framebuffer, "texture");
     }
 
     const bool src_rescaling = texture_cache.IsRescaling() && texture.IsRescaled();
@@ -1499,7 +1499,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (frame_dump.Capturing()) {
-        FrameDumpPass(framebuffer);
+        FrameDumpPass(framebuffer, "clear");
+        frame_dump.NoteClear();
     }
     const VkExtent2D render_area = framebuffer->RenderArea();
     const u32 base_array_layer = regs.clear_surface.layer;
@@ -2376,7 +2377,7 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
     return frame_dump.NoteBuffers(compute, shader_hashes, buffers);
 }
 
-void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
+void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer, std::string_view cause) {
     std::array<ImageView*, VideoCommon::NUM_RT> colors{};
     const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
     for (size_t slot = 0; slot < ids.size(); ++slot) {
@@ -2384,7 +2385,10 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
             colors[slot] = &texture_cache.GetImageView(ids[slot]);
         }
     }
-    if (frame_dump.BeginPass(framebuffer, colors)) {
+    const ImageViewId depth_id = texture_cache.GetRenderTargets().depth_buffer_id;
+    ImageView* const depth = depth_id ? &texture_cache.GetImageView(depth_id) : nullptr;
+    if (frame_dump.BeginPass(framebuffer, colors, depth, cause,
+                             Tegra::Engines::RtBindWrites())) {
         scheduler.RequestRenderpass(framebuffer);
     }
 }
@@ -2427,7 +2431,7 @@ void RasterizerVulkan::TickFrame() {
                                                ReadGpuMemory(spaces, read->gpu_address, read->size));
         }
     }
-    frame_dump.TickFrame();
+    frame_dump.TickFrame(Tegra::Engines::RtBindWrites());
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;

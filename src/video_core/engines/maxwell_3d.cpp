@@ -346,6 +346,7 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     // CallMethod does.
     const bool skip_same = SkipSameValueWrites();
     const auto process = [&](u32 method, u32 value) {
+        NoteRtBindWrite(method);
         if (!skip_same || regs.reg_array[method] != value) {
             ProcessDirtyRegisters(method, value);
         } else if (VideoCommon::Nx2DrawRuns::g_enabled) [[unlikely]] {
@@ -634,6 +635,7 @@ bool IsStoreOnlyExecutable(u32 method) {
 // no write history, trace or profile, not a macro call or SET_SHADOW_RAM_CONTROL. The hot
 // executable methods go straight to their handler.
 void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_call) {
+    NoteRtBindWrite(method);
     const u32 argument = ProcessShadowRam(method, method_argument);
     if (!execution_mask[method]) {
         if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
@@ -783,6 +785,7 @@ void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argu
     if (g_trace_first_method_writes) [[unlikely]] {
         TraceFirstMethodWrite(method, method_argument);
     }
+    NoteRtBindWrite(method);
 
     ASSERT(method < Regs::NUM_REGS && "Invalid Maxwell3D register, increase the size of the Regs structure");
     if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
